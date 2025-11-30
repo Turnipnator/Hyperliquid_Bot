@@ -1,5 +1,6 @@
 import pino from 'pino';
 import Decimal from 'decimal.js';
+import http from 'http';
 import { config } from './config/config';
 import { HyperliquidClient } from './core/exchange/HyperliquidClient';
 import { BreakoutStrategy } from './core/strategy/BreakoutStrategy';
@@ -294,14 +295,31 @@ async function main() {
 
   const bot = new HyperliquidBot();
 
+  // Start health check server for Docker
+  const healthServer = http.createServer((req, res) => {
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+
+  healthServer.listen(3000, () => {
+    logger.info('Health check server listening on port 3000');
+  });
+
   // Handle graceful shutdown
   process.on('SIGINT', async () => {
     logger.info('\n👋 Received SIGINT, shutting down gracefully...');
+    healthServer.close();
     await bot.stop();
   });
 
   process.on('SIGTERM', async () => {
     logger.info('\n👋 Received SIGTERM, shutting down gracefully...');
+    healthServer.close();
     await bot.stop();
   });
 
