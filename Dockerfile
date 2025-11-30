@@ -16,7 +16,7 @@ RUN npm install --production=false
 COPY . .
 
 # Build TypeScript
-RUN pnpm build
+RUN npm run build
 
 # Create non-root user
 RUN addgroup -g 1001 -S nodejs && \
