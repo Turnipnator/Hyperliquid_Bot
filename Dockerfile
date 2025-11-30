@@ -7,11 +7,10 @@ RUN apk add --no-cache python3 make g++
 WORKDIR /app
 
 # Copy package files
-COPY package.json pnpm-lock.yaml* ./
+COPY package.json ./
 
-# Install pnpm and dependencies
-RUN npm install -g pnpm && \
-    pnpm install --frozen-lockfile
+# Install dependencies with npm (simpler for Docker)
+RUN npm install --production=false
 
 # Copy source code
 COPY . .
