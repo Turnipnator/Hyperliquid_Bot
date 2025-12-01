@@ -39,6 +39,33 @@ export class BreakoutStrategy {
   private stopLossCooldowns: Map<string, number> = new Map();
   private readonly STOP_LOSS_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
 
+  /**
+   * Get trailing stop percentage based on 90-day volatility analysis
+   * Tiered stops to match each pair's ATR (Average True Range):
+   * - Low volatility (BTC/ETH/BNB): 6% - ATR ~3-5.5%
+   * - Medium volatility (SOL/XRP): 8% - ATR ~6-6.5%
+   * - High volatility (LINK/AVAX/SUI/HYPE): 10% - ATR ~7.5-8.5%
+   */
+  private getTrailingStopPercent(symbol: string): number {
+    // Low volatility tier - 6% stop (~1.5x their ATR)
+    if (symbol === 'BTC' || symbol === 'ETH' || symbol === 'BNB') {
+      return 6;
+    }
+
+    // Medium volatility tier - 8% stop (~1.3x their ATR)
+    if (symbol === 'SOL' || symbol === 'XRP') {
+      return 8;
+    }
+
+    // High volatility tier - 10% stop (~1.3x their ATR)
+    if (symbol === 'LINK' || symbol === 'AVAX' || symbol === 'SUI' || symbol === 'HYPE') {
+      return 10;
+    }
+
+    // Default to config value for unknown pairs
+    return this.config.trailingStopPercent;
+  }
+
   constructor(client: HyperliquidClient, strategyConfig: BreakoutConfig, telegram?: TelegramService) {
     this.client = client;
     this.config = strategyConfig;
@@ -304,10 +331,11 @@ export class BreakoutStrategy {
 
         const side = breakout === 'BULLISH' ? OrderSide.BUY : OrderSide.SELL;
         const entryPrice = currentPrice;
+        const trailingStopPct = this.getTrailingStopPercent(symbol);
         const stopLoss =
           breakout === 'BULLISH'
-            ? entryPrice.times(1 - this.config.trailingStopPercent / 100)
-            : entryPrice.times(1 + this.config.trailingStopPercent / 100);
+            ? entryPrice.times(1 - trailingStopPct / 100)
+            : entryPrice.times(1 + trailingStopPct / 100);
 
         const rsi = TechnicalIndicators.calculateRSI(history);
 
@@ -438,7 +466,7 @@ export class BreakoutStrategy {
           if (distanceFromHigh.lessThanOrEqualTo(maxDistanceFromHigh)) {
             if (priceStructure === 'LOWER_LOWS') {
               const entryPrice = currentPrice;
-              const stopLoss = entryPrice.times(1 + this.config.trailingStopPercent / 100);
+              const stopLoss = entryPrice.times(1 + this.getTrailingStopPercent(symbol) / 100);
 
               const rsi = TechnicalIndicators.calculateRSI(history);
 
@@ -472,7 +500,7 @@ export class BreakoutStrategy {
           if (distanceFromLow.lessThanOrEqualTo(maxDistanceFromHigh)) {
             if (priceStructure === 'HIGHER_HIGHS') {
               const entryPrice = currentPrice;
-              const stopLoss = entryPrice.times(1 - this.config.trailingStopPercent / 100);
+              const stopLoss = entryPrice.times(1 - this.getTrailingStopPercent(symbol) / 100);
 
               const rsi = TechnicalIndicators.calculateRSI(history);
 
@@ -612,9 +640,9 @@ export class BreakoutStrategy {
         if (position.side === OrderSide.BUY) {
           if (position.markPrice.greaterThan(trailingStop.high)) {
             trailingStop.high = position.markPrice;
-            trailingStop.stop = position.markPrice.times(1 - this.config.trailingStopPercent / 100);
+            trailingStop.stop = position.markPrice.times(1 - this.getTrailingStopPercent(position.symbol) / 100);
             this.trailingStops.set(position.symbol, trailingStop);
-            this.logger.info(`Updated trailing stop for ${position.symbol}: ${trailingStop.stop.toFixed(2)}`);
+            this.logger.info(`Updated trailing stop for ${position.symbol}: ${trailingStop.stop.toFixed(2)} (${this.getTrailingStopPercent(position.symbol)}% tiered stop)`);
           }
 
           // Check if stop hit
