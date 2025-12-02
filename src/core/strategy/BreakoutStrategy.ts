@@ -37,6 +37,7 @@ export class BreakoutStrategy {
   private trailingStops: Map<string, { high: Decimal; stop: Decimal }> = new Map();
   private trendHistory: Map<string, Array<'UPTREND' | 'DOWNTREND' | 'SIDEWAYS'>> = new Map();
   private stopLossCooldowns: Map<string, number> = new Map();
+  private scanCounts: Map<string, number> = new Map();
   private readonly STOP_LOSS_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
 
   /**
@@ -390,6 +391,29 @@ export class BreakoutStrategy {
         if (trendFollowingSignal) {
           return trendFollowingSignal;
         }
+      }
+
+      // Log scan summary when no signal (every 10 scans to avoid spam)
+      const scanCount = (this.scanCounts.get(symbol) || 0) + 1;
+      this.scanCounts.set(symbol, scanCount);
+
+      if (scanCount % 10 === 0) {
+        const lastCandle = history[history.length - 1];
+        const volRatio = lastCandle.volume.dividedBy(avgVolume).toFixed(2);
+        const distToRes = resistance.minus(currentPrice).dividedBy(currentPrice).times(100).toFixed(2);
+        const distToSup = currentPrice.minus(support).dividedBy(currentPrice).times(100).toFixed(2);
+
+        this.logger.info({
+          symbol,
+          price: currentPrice.toFixed(2),
+          resistance: resistance.toFixed(2),
+          support: support.toFixed(2),
+          distToResistance: `${distToRes}%`,
+          distToSupport: `${distToSup}%`,
+          volumeRatio: `${volRatio}x`,
+          trend,
+          structure: priceStructure,
+        }, `📊 ${symbol}: No signal - Price $${currentPrice.toFixed(2)}, Trend: ${trend}, Vol: ${volRatio}x avg`);
       }
 
       return null;
