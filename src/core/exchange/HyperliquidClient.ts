@@ -266,19 +266,25 @@ export class HyperliquidClient {
       const endTime = Date.now();
       const startTime = endTime - (10 * 60 * 1000); // Last 10 minutes to ensure we get at least 1 candle
 
-      const response = await this.infoRequest('candleSnapshot', {
-        coin,
-        interval,
-        startTime,
-        endTime,
+      // Note: candleSnapshot requires nested 'req' object
+      const response = await this.api.post('/info', {
+        type: 'candleSnapshot',
+        req: {
+          coin,
+          interval,
+          startTime,
+          endTime,
+        },
       });
 
-      if (!response || !Array.isArray(response) || response.length === 0) {
+      const data = response.data;
+
+      if (!data || !Array.isArray(data) || data.length === 0) {
         return null;
       }
 
       // Get the most recent candle
-      const latestCandle = response[response.length - 1];
+      const latestCandle = data[data.length - 1];
       return {
         high: new Decimal(latestCandle.h),
         low: new Decimal(latestCandle.l),
