@@ -260,10 +260,45 @@ export class HyperliquidClient {
     return await this.exchangeRequest(cancelAction);
   }
 
+  // Get latest candle from Hyperliquid (includes volume)
+  async getLatestCandle(coin: string, interval: string = '5m'): Promise<{ high: Decimal; low: Decimal; close: Decimal; volume: Decimal } | null> {
+    try {
+      const endTime = Date.now();
+      const startTime = endTime - (10 * 60 * 1000); // Last 10 minutes to ensure we get at least 1 candle
+
+      const response = await this.infoRequest('candleSnapshot', {
+        coin,
+        interval,
+        startTime,
+        endTime,
+      });
+
+      if (!response || !Array.isArray(response) || response.length === 0) {
+        return null;
+      }
+
+      // Get the most recent candle
+      const latestCandle = response[response.length - 1];
+      return {
+        high: new Decimal(latestCandle.h),
+        low: new Decimal(latestCandle.l),
+        close: new Decimal(latestCandle.c),
+        volume: new Decimal(latestCandle.v),
+      };
+    } catch (error) {
+      this.logger.warn({ error, coin }, 'Failed to get latest candle, using fallback');
+      return null;
+    }
+  }
+
   // Get market data for a coin
   async getMarketData(coin: string): Promise<MarketData> {
     try {
-      const [mids, l2Book] = await Promise.all([this.getAllMids(), this.getL2Book(coin)]);
+      const [mids, l2Book, latestCandle] = await Promise.all([
+        this.getAllMids(),
+        this.getL2Book(coin),
+        this.getLatestCandle(coin),
+      ]);
 
       const mid = mids[coin];
       if (!mid) {
@@ -278,12 +313,17 @@ export class HyperliquidClient {
         ? new Decimal(l2Book.levels[1][0].px)
         : last;
 
+      // Use candle data for high/low/volume if available
+      const high24h = latestCandle?.high || last;
+      const low24h = latestCandle?.low || last;
+      const volume24h = latestCandle?.volume || new Decimal(0);
+
       return {
         symbol: coin,
         last,
-        high24h: last, // Note: Hyperliquid doesn't provide 24h high/low directly
-        low24h: last,
-        volume24h: new Decimal(0), // Would need to calculate from trades
+        high24h,
+        low24h,
+        volume24h,
         timestamp: Date.now(),
         bid,
         ask,
