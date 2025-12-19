@@ -16,6 +16,7 @@ export interface BotStatusProvider {
       side: string;
       quantity: string;
       entryPrice: string;
+      markPrice: string;
       unrealizedPnl: string;
     }>;
     dailyPnl: number;
@@ -237,12 +238,14 @@ Welcome! I'm your automated trading assistant for Hyperliquid Markets.
 
 <b>Available Commands:</b>
 /status - Current bot status and positions
+/positions - Detailed position view with P&L %
 /daily - Daily P&L summary
 /weekly - Weekly performance report
 /alltime - All-time statistics
+/restart - Restart the bot
 /stop - Emergency stop bot
 
-Use these commands to monitor your trading bot.`;
+Use these commands to monitor and control your trading bot.`;
 
       await this.sendMessage(welcomeMessage);
     });
@@ -287,6 +290,72 @@ Daily P&L: $${status.dailyPnl.toFixed(2)}${positionsText}`;
       }
     });
 
+    // /positions command - detailed position view
+    this.bot.onText(/\/positions/, async (msg) => {
+      if (msg.chat.id.toString() !== this.chatId) return;
+
+      try {
+        if (!this.statusProvider) {
+          await this.sendMessage('❌ Status provider not available');
+          return;
+        }
+
+        const status = await this.statusProvider.getStatus();
+
+        if (status.positions.length === 0) {
+          await this.sendMessage('📭 <b>No Open Positions</b>\n\nYou have no active trades.');
+          return;
+        }
+
+        let message = `📊 <b>Open Positions</b> (${status.positions.length})\n`;
+        message += `━━━━━━━━━━━━━━━━━━━━━\n`;
+
+        for (const pos of status.positions) {
+          const entryPrice = parseFloat(pos.entryPrice);
+          const markPrice = parseFloat(pos.markPrice);
+          const unrealizedPnl = parseFloat(pos.unrealizedPnl);
+          const quantity = parseFloat(pos.quantity);
+
+          // Calculate P&L percentage
+          const positionValue = entryPrice * quantity;
+          const pnlPercent = positionValue > 0 ? (unrealizedPnl / positionValue) * 100 : 0;
+
+          // Determine emoji based on P&L
+          let pnlEmoji = '⚪';
+          if (pnlPercent >= 2) pnlEmoji = '🟢';
+          else if (pnlPercent >= 0.5) pnlEmoji = '🟡';
+          else if (pnlPercent >= 0) pnlEmoji = '⚪';
+          else if (pnlPercent >= -1) pnlEmoji = '🟠';
+          else pnlEmoji = '🔴';
+
+          const sideEmoji = pos.side === 'BUY' ? '📈' : '📉';
+          const sideText = pos.side === 'BUY' ? 'LONG' : 'SHORT';
+
+          // Price change direction
+          const priceChange = markPrice - entryPrice;
+          const priceChangePercent = (priceChange / entryPrice) * 100;
+          const priceArrow = priceChange >= 0 ? '↑' : '↓';
+
+          message += `\n${sideEmoji} <b>${pos.symbol}</b> ${sideText}\n`;
+          message += `├ Entry: $${entryPrice.toFixed(2)}\n`;
+          message += `├ Mark:  $${markPrice.toFixed(2)} ${priceArrow}${Math.abs(priceChangePercent).toFixed(2)}%\n`;
+          message += `├ Size:  ${quantity}\n`;
+          message += `└ ${pnlEmoji} P&L: $${unrealizedPnl.toFixed(2)} (${pnlPercent >= 0 ? '+' : ''}${pnlPercent.toFixed(2)}%)\n`;
+        }
+
+        // Summary
+        const totalPnl = status.positions.reduce((sum, p) => sum + parseFloat(p.unrealizedPnl), 0);
+        const totalPnlEmoji = totalPnl >= 0 ? '✅' : '❌';
+        message += `\n━━━━━━━━━━━━━━━━━━━━━\n`;
+        message += `${totalPnlEmoji} <b>Total P&L:</b> $${totalPnl.toFixed(2)}`;
+
+        await this.sendMessage(message);
+      } catch (error) {
+        this.logger.error({ error }, 'Failed to get positions');
+        await this.sendMessage('❌ Failed to get positions');
+      }
+    });
+
     // /daily command
     this.bot.onText(/\/daily/, async (msg) => {
       if (msg.chat.id.toString() !== this.chatId) return;
@@ -323,12 +392,101 @@ Win Rate: ${winRate}%`;
       }
     });
 
+    // /weekly command
+    this.bot.onText(/\/weekly/, async (msg) => {
+      if (msg.chat.id.toString() !== this.chatId) return;
+
+      try {
+        if (!this.statusProvider) {
+          await this.sendMessage('❌ Status provider not available');
+          return;
+        }
+
+        const status = await this.statusProvider.getStatus();
+        const weeklyPnl = status.balance - this.weeklyStartBalance;
+        const emoji = weeklyPnl >= 0 ? '🚀' : '📊';
+        const winRate = this.weeklyTrades.total > 0
+          ? ((this.weeklyTrades.wins / this.weeklyTrades.total) * 100).toFixed(1)
+          : '0.0';
+
+        const message = `${emoji} <b>Weekly Summary</b>
+
+Balance: $${status.balance.toFixed(2)}
+Weekly P&L: $${weeklyPnl.toFixed(2)}
+
+Total Trades: ${this.weeklyTrades.total}
+Wins: ${this.weeklyTrades.wins} | Losses: ${this.weeklyTrades.losses}
+Win Rate: ${winRate}%`;
+
+        await this.sendMessage(message);
+      } catch (error) {
+        this.logger.error({ error }, 'Failed to get weekly stats');
+        await this.sendMessage('❌ Failed to get weekly summary');
+      }
+    });
+
+    // /alltime command
+    this.bot.onText(/\/alltime/, async (msg) => {
+      if (msg.chat.id.toString() !== this.chatId) return;
+
+      try {
+        if (!this.statusProvider) {
+          await this.sendMessage('❌ Status provider not available');
+          return;
+        }
+
+        const status = await this.statusProvider.getStatus();
+        const allTimePnl = status.balance - this.startBalance;
+        const emoji = allTimePnl >= 0 ? '💰' : '📉';
+        const winRate = this.allTimeTrades.total > 0
+          ? ((this.allTimeTrades.wins / this.allTimeTrades.total) * 100).toFixed(1)
+          : '0.0';
+        const pnlPercent = this.startBalance > 0
+          ? ((allTimePnl / this.startBalance) * 100).toFixed(2)
+          : '0.00';
+
+        const message = `${emoji} <b>All-Time Statistics</b>
+
+Starting Balance: $${this.startBalance.toFixed(2)}
+Current Balance: $${status.balance.toFixed(2)}
+Total P&L: $${allTimePnl.toFixed(2)} (${pnlPercent}%)
+
+Total Trades: ${this.allTimeTrades.total}
+Wins: ${this.allTimeTrades.wins} | Losses: ${this.allTimeTrades.losses}
+Win Rate: ${winRate}%`;
+
+        await this.sendMessage(message);
+      } catch (error) {
+        this.logger.error({ error }, 'Failed to get all-time stats');
+        await this.sendMessage('❌ Failed to get all-time statistics');
+      }
+    });
+
+    // /restart command
+    this.bot.onText(/\/restart/, async (msg) => {
+      if (msg.chat.id.toString() !== this.chatId) return;
+
+      try {
+        await this.sendMessage('🔄 Restarting bot...');
+
+        if (!this.statusProvider) {
+          await this.sendMessage('❌ Cannot restart: Status provider not available');
+          return;
+        }
+
+        await this.statusProvider.restart();
+      } catch (error) {
+        this.logger.error({ error }, 'Failed to restart bot');
+        await this.sendMessage('❌ Failed to restart bot');
+      }
+    });
+
     // /stop command (emergency stop)
     this.bot.onText(/\/stop/, async (msg) => {
       if (msg.chat.id.toString() !== this.chatId) return;
 
       try {
-        await this.sendMessage('🛑 Emergency stop requested...');
+        await this.sendMessage('🛑 Stopping bot safely...');
 
         if (!this.statusProvider) {
           await this.sendMessage('❌ Cannot stop: Status provider not available');

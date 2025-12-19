@@ -3,6 +3,7 @@ import { ethers } from 'ethers';
 import Decimal from 'decimal.js';
 import pino from 'pino';
 import WebSocket from 'ws';
+import * as msgpack from '@msgpack/msgpack';
 import {
   Environment,
   MarketData,
@@ -30,6 +31,7 @@ export class HyperliquidClient {
   private readonly wsUrl: string;
   private readonly api: AxiosInstance;
   private readonly logger: pino.Logger;
+  private readonly isMainnet: boolean;
   private meta: HyperliquidMeta | null = null;
   private ws: WebSocket | null = null;
 
@@ -37,9 +39,10 @@ export class HyperliquidClient {
     this.wallet = new ethers.Wallet(config.privateKey);
     this.accountAddress = config.accountAddress.toLowerCase();
     this.logger = pino({ name: 'HyperliquidClient' });
+    this.isMainnet = config.environment === Environment.MAINNET;
 
     // Set URLs based on environment
-    if (config.environment === Environment.MAINNET) {
+    if (this.isMainnet) {
       this.baseUrl = 'https://api.hyperliquid.xyz';
       this.wsUrl = 'wss://api.hyperliquid.xyz/ws';
     } else {
@@ -82,18 +85,21 @@ export class HyperliquidClient {
     }
   }
 
-  private async exchangeRequest(action: any, nonce?: number): Promise<any> {
+  private async exchangeRequest(action: any, nonce?: number, vaultAddress?: string): Promise<any> {
     try {
       const timestamp = nonce || Date.now();
 
-      // Sign the action using EIP-712
-      const signature = await this.signL1Action(action, timestamp);
+      // Sign the action using phantom agent mechanism
+      const signature = await this.signL1Action(action, timestamp, vaultAddress);
 
       const payload = {
         action,
         nonce: timestamp,
         signature,
+        vaultAddress: vaultAddress || null,
       };
+
+      this.logger.debug({ action: action.type, nonce: timestamp }, 'Sending exchange request');
 
       const response = await axios.post(`${this.baseUrl}/exchange`, payload);
 
@@ -102,44 +108,93 @@ export class HyperliquidClient {
       }
 
       return response.data;
-    } catch (error) {
-      this.logger.error({ error, action }, 'Exchange request failed');
+    } catch (error: any) {
+      // Extract useful error info from Axios errors
+      const errorInfo = {
+        message: error?.message,
+        status: error?.response?.status,
+        statusText: error?.response?.statusText,
+        responseData: error?.response?.data,
+      };
+      this.logger.error({ errorInfo, action }, 'Exchange request failed');
       throw error;
     }
   }
 
-  private async signL1Action(action: any, nonce: number): Promise<string> {
-    // Hyperliquid uses EIP-712 signing for L1 actions
-    // Domain definition
+  private async signL1Action(action: any, nonce: number, vaultAddress?: string): Promise<{ r: string; s: string; v: number }> {
+    // Hyperliquid uses a "phantom agent" mechanism for L1 action signing:
+    // 1. Serialize action with msgpack
+    // 2. Append nonce as BIG-ENDIAN 8-byte int
+    // 3. Append vault flag byte (0x00 = no vault, 0x01 = vault) + vault address if present
+    // 4. Hash with keccak256 to get connectionId
+    // 5. Sign a phantom Agent object
+
+    // EIP-712 domain for Exchange
     const domain = {
       name: 'Exchange',
       version: '1',
-      chainId: 1337, // Hyperliquid uses chainId 1337
+      chainId: 1337,
       verifyingContract: '0x0000000000000000000000000000000000000000',
     };
 
-    // Message types depend on the action type
-    // For orders, we use the 'Order' type
+    // Only the Agent type is used for signing
     const types = {
       Agent: [
         { name: 'source', type: 'string' },
         { name: 'connectionId', type: 'bytes32' },
       ],
-      Order: [
-        { name: 'a', type: 'uint32' },
-        { name: 'b', type: 'bool' },
-        { name: 'p', type: 'string' },
-        { name: 'S', type: 'string' },
-        { name: 'r', type: 'bool' },
-        { name: 't', type: 'string' },
-        { name: 'c', type: 'string' },
-      ],
     };
 
     try {
-      // Sign the typed data
-      const signature = await this.wallet.signTypedData(domain, types, action);
-      return signature;
+      // Step 1: Encode action with msgpack
+      const actionBytes = msgpack.encode(action);
+
+      // Step 2: Create buffer with action + nonce + vault flag/address
+      // Nonce is 8 bytes BIG-ENDIAN (not little-endian!)
+      const nonceBuffer = Buffer.alloc(8);
+      nonceBuffer.writeBigUInt64BE(BigInt(nonce));
+
+      // Vault address format: flag byte (0x00 = no vault, 0x01 = has vault) + address if present
+      let vaultBuffer: Buffer;
+      if (vaultAddress) {
+        vaultBuffer = Buffer.concat([
+          Buffer.from([0x01]),
+          Buffer.from(vaultAddress.replace('0x', '').toLowerCase(), 'hex'),
+        ]);
+      } else {
+        vaultBuffer = Buffer.from([0x00]);
+      }
+
+      // Combine: action | nonce | vaultFlag[+vaultAddress]
+      const dataToHash = Buffer.concat([
+        Buffer.from(actionBytes),
+        nonceBuffer,
+        vaultBuffer,
+      ]);
+
+      // Step 3: Hash to get connectionId
+      const connectionId = ethers.keccak256(dataToHash);
+
+      // Step 4: Create phantom agent
+      // source is "a" for mainnet, "b" for testnet
+      const phantomAgent = {
+        source: this.isMainnet ? 'a' : 'b',
+        connectionId: connectionId,
+      };
+
+      this.logger.debug({ phantomAgent, nonce }, 'Signing phantom agent');
+
+      // Step 5: Sign the phantom agent
+      const signature = await this.wallet.signTypedData(domain, types, phantomAgent);
+
+      // Parse signature into r, s, v components
+      const sig = ethers.Signature.from(signature);
+
+      return {
+        r: sig.r,
+        s: sig.s,
+        v: sig.v,
+      };
     } catch (error) {
       this.logger.error({ error, action }, 'Failed to sign L1 action');
       throw error;
@@ -198,6 +253,27 @@ export class HyperliquidClient {
     return index;
   }
 
+  // Get size decimals for a coin (for proper rounding)
+  private getSzDecimals(coin: string): number {
+    if (!this.meta) {
+      throw new Error('Meta not loaded. Call initialize() first.');
+    }
+
+    const asset = this.meta.universe.find((u) => u.name === coin);
+    if (!asset) {
+      throw new Error(`Unknown coin: ${coin}`);
+    }
+
+    return asset.szDecimals;
+  }
+
+  // Round size to correct decimal places for the asset
+  private roundSize(size: Decimal, coin: string): string {
+    const szDecimals = this.getSzDecimals(coin);
+    // Round DOWN to avoid exceeding available balance
+    return size.toFixed(szDecimals, Decimal.ROUND_DOWN);
+  }
+
   // Place an order
   async placeOrder(
     coin: string,
@@ -210,6 +286,11 @@ export class HyperliquidClient {
   ): Promise<HyperliquidOrderResponse> {
     const asset = this.getCoinIndex(coin);
 
+    // Round size to correct decimal places for this asset
+    const roundedSize = this.roundSize(size, coin);
+
+    this.logger.info({ coin, originalSize: size.toString(), roundedSize }, 'Placing order with rounded size');
+
     const orderAction = {
       type: 'order',
       orders: [
@@ -217,7 +298,7 @@ export class HyperliquidClient {
           a: asset,
           b: side === OrderSide.BUY,
           p: price.toString(),
-          s: size.toString(),
+          s: roundedSize,
           r: reduceOnly,
           t: { limit: { tif: timeInForce } },
         },

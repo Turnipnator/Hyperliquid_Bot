@@ -194,11 +194,8 @@ pnpm install              # Install deps
 pnpm dev                  # Run bot
 ```
 
-### Production
-```bash
-pnpm build                # Compile TypeScript
-pnpm start:live           # Run in production
-```
+### Production VPS
+See `.deployment` file for VPS connection details (gitignored).
 
 ### Monitoring
 - Logs written to console (pino)

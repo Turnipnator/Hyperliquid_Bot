@@ -260,6 +260,7 @@ class HyperliquidBot implements BotStatusProvider {
       side: string;
       quantity: string;
       entryPrice: string;
+      markPrice: string;
       unrealizedPnl: string;
     }>;
     dailyPnl: number;
@@ -276,6 +277,7 @@ class HyperliquidBot implements BotStatusProvider {
           side: p.side,
           quantity: p.quantity.toString(),
           entryPrice: p.entryPrice.toFixed(2),
+          markPrice: p.markPrice.toFixed(2),
           unrealizedPnl: p.unrealizedPnl.toFixed(2),
         })),
         dailyPnl: this.riskManager.getDailyPnl().toNumber(),

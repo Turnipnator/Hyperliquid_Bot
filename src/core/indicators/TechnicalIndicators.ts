@@ -10,21 +10,27 @@ export interface PriceData {
 
 export class TechnicalIndicators {
   public static calculateResistance(prices: PriceData[], lookbackPeriod: number): Decimal {
-    if (prices.length < lookbackPeriod) {
-      throw new Error(`Insufficient data: need ${lookbackPeriod} periods, got ${prices.length}`);
+    // Need lookbackPeriod + 1 because we exclude the current candle
+    if (prices.length < lookbackPeriod + 1) {
+      throw new Error(`Insufficient data: need ${lookbackPeriod + 1} periods, got ${prices.length}`);
     }
 
-    const recentPrices = prices.slice(-lookbackPeriod);
+    // Exclude current candle (-1) to prevent resistance from chasing price
+    // This allows breakouts to be detected when price exceeds PREVIOUS highs
+    const recentPrices = prices.slice(-lookbackPeriod - 1, -1);
     const highs = recentPrices.map((p) => p.high);
     return Decimal.max(...highs);
   }
 
   public static calculateSupport(prices: PriceData[], lookbackPeriod: number): Decimal {
-    if (prices.length < lookbackPeriod) {
-      throw new Error(`Insufficient data: need ${lookbackPeriod} periods, got ${prices.length}`);
+    // Need lookbackPeriod + 1 because we exclude the current candle
+    if (prices.length < lookbackPeriod + 1) {
+      throw new Error(`Insufficient data: need ${lookbackPeriod + 1} periods, got ${prices.length}`);
     }
 
-    const recentPrices = prices.slice(-lookbackPeriod);
+    // Exclude current candle (-1) to prevent support from chasing price
+    // This allows breakdowns to be detected when price drops below PREVIOUS lows
+    const recentPrices = prices.slice(-lookbackPeriod - 1, -1);
     const lows = recentPrices.map((p) => p.low);
     return Decimal.min(...lows);
   }

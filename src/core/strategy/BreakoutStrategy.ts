@@ -6,6 +6,7 @@ import { TechnicalIndicators, PriceData } from '../indicators/TechnicalIndicator
 import { config } from '../../config/config';
 import { HealthCheck } from '../../utils/healthCheck';
 import { TelegramService } from '../../services/telegram/TelegramService';
+import { BinanceDataService } from '../../services/data/BinanceDataService';
 
 export interface BreakoutConfig {
   lookbackPeriod: number;
@@ -32,7 +33,9 @@ export class BreakoutStrategy {
   private readonly config: BreakoutConfig;
   private readonly logger: pino.Logger;
   private readonly telegram?: TelegramService;
+  private readonly dataService: BinanceDataService;
   private priceHistory: Map<string, PriceData[]> = new Map();
+  private lastCandleTimestamp: Map<string, number> = new Map(); // Track last candle time to avoid duplicates
   private activeSignals: Map<string, Signal> = new Map();
   private trailingStops: Map<string, { high: Decimal; stop: Decimal }> = new Map();
   private trendHistory: Map<string, Array<'UPTREND' | 'DOWNTREND' | 'SIDEWAYS'>> = new Map();
@@ -72,6 +75,7 @@ export class BreakoutStrategy {
     this.config = strategyConfig;
     this.telegram = telegram;
     this.logger = pino({ name: 'BreakoutStrategy', level: config.logLevel });
+    this.dataService = new BinanceDataService(config.binanceBaseUrl);
   }
 
   private roundToIncrement(price: Decimal, symbol: string): Decimal {
@@ -99,30 +103,41 @@ export class BreakoutStrategy {
 
   public async updatePriceHistory(symbol: string): Promise<void> {
     try {
-      const marketData = await this.client.getMarketData(symbol);
+      // Fetch latest 5m candles from the same source as historical data
+      // This ensures volume comparisons are apples-to-apples
+      const recentCandles = await this.dataService.getHistoricalCandles(symbol, '5m', 5);
 
-      const currentPriceData: PriceData = {
-        high: marketData.high24h,
-        low: marketData.low24h,
-        close: marketData.last,
-        volume: marketData.volume24h,
-        timestamp: new Date(marketData.timestamp),
-      };
+      if (!recentCandles || recentCandles.length === 0) {
+        this.logger.debug(`No recent candles fetched for ${symbol}`);
+        return;
+      }
 
       const history = this.priceHistory.get(symbol) || [];
-      const previousPrice = history.length > 0 ? history[history.length - 1].close : new Decimal(0);
+      const lastKnownTimestamp = this.lastCandleTimestamp.get(symbol) || 0;
+      let newCandlesAdded = 0;
 
-      history.push(currentPriceData);
+      // Only add candles that are newer than what we have
+      for (const candle of recentCandles) {
+        const candleTime = candle.timestamp.getTime();
+        if (candleTime > lastKnownTimestamp) {
+          history.push(candle);
+          this.lastCandleTimestamp.set(symbol, candleTime);
+          newCandlesAdded++;
+        }
+      }
 
-      // Keep only necessary history
-      const maxHistory = this.config.lookbackPeriod * 2;
+      // Keep only necessary history (50 candles = ~4 hours of 5m data)
+      const maxHistory = Math.max(50, this.config.lookbackPeriod * 2);
       if (history.length > maxHistory) {
         history.splice(0, history.length - maxHistory);
       }
 
       this.priceHistory.set(symbol, history);
 
-      this.logger.debug(`Updated ${symbol} price: ${previousPrice.toString()} -> ${currentPriceData.close.toString()} (${history.length} points)`);
+      if (newCandlesAdded > 0) {
+        const latestCandle = history[history.length - 1];
+        this.logger.debug(`${symbol}: Added ${newCandlesAdded} new candle(s), total: ${history.length}, latest close: $${latestCandle.close.toFixed(2)}`);
+      }
     } catch (error) {
       this.logger.error({ error, symbol }, `Failed to update price history for ${symbol}`);
     }
@@ -133,6 +148,13 @@ export class BreakoutStrategy {
     historicalData: PriceData[]
   ): void {
     this.priceHistory.set(symbol, [...historicalData]);
+
+    // Set the last candle timestamp to avoid re-adding these candles
+    if (historicalData.length > 0) {
+      const lastCandle = historicalData[historicalData.length - 1];
+      this.lastCandleTimestamp.set(symbol, lastCandle.timestamp.getTime());
+    }
+
     this.logger.info(
       { symbol, dataPoints: historicalData.length },
       `Initialized ${symbol} with historical data`
@@ -269,30 +291,38 @@ export class BreakoutStrategy {
         const signalType = candleBreakout || largeMoveType || cumulativeMoveType;
         const volumeOK = candleVolumeSpike || (cumulativeMoveType !== null);
 
+        // Debug: Log signal detection status for latest candle only
+        if (i === history.length - 1) {
+          const volRatio = candle.volume.dividedBy(avgVolume).toFixed(2);
+          this.logger.debug({
+            symbol,
+            candleBreakout,
+            largeMoveType,
+            cumulativeMoveType,
+            volumeSpike: candleVolumeSpike,
+            volumeRatio: `${volRatio}x`,
+            requiredVol: `${this.config.volumeMultiplier}x`,
+            signalType,
+            volumeOK,
+          }, `${symbol}: Signal check - breakout: ${candleBreakout || 'none'}, largeMove: ${largeMoveType || 'none'}, cumulative: ${cumulativeMoveType || 'none'}, vol: ${volRatio}x`);
+        }
+
         if (signalType && volumeOK) {
-          // Trend alignment
-          let trendAligned = false;
+          // NOTE: Trend alignment DISABLED - matching Enclave approach exactly
+          // Price action + volume is sufficient confirmation
+          // Only price structure filters are used (LOWER_LOWS, HIGHER_HIGHS, CHOPPY)
+          this.logger.debug(`${symbol}: ${signalType} signal found in ${trend} market - trend filter DISABLED`);
 
-          if (cumulativeMoveType !== null) {
-            trendAligned = (signalType === 'BULLISH' && (trend === 'UPTREND' || trend === 'SIDEWAYS')) ||
-                          (signalType === 'BEARISH' && (trend === 'DOWNTREND' || trend === 'SIDEWAYS'));
-          } else {
-            trendAligned = (signalType === 'BULLISH' && trend === 'UPTREND') ||
-                          (signalType === 'BEARISH' && trend === 'DOWNTREND');
-          }
-
-          if (!trendAligned) {
-            continue;
-          }
-
-          // Check if trend still valid
+          // Check if price action still valid
           if (signalType === 'BULLISH' && currentPrice.greaterThan(support)) {
             breakoutCandle = candle;
             breakoutType = 'BULLISH';
+            this.logger.info(`${symbol}: Found BULLISH signal - price $${candle.close.toFixed(2)}, vol ${candle.volume.dividedBy(avgVolume).toFixed(1)}x, above support`);
             break;
           } else if (signalType === 'BEARISH' && currentPrice.lessThan(resistance)) {
             breakoutCandle = candle;
             breakoutType = 'BEARISH';
+            this.logger.info(`${symbol}: Found BEARISH signal - price $${candle.close.toFixed(2)}, vol ${candle.volume.dividedBy(avgVolume).toFixed(1)}x, below resistance`);
             break;
           }
         }
@@ -302,18 +332,11 @@ export class BreakoutStrategy {
       const volumeSpike = breakoutCandle !== null;
 
       if (breakout && volumeSpike && breakoutCandle) {
-        // Reject counter-trend trades
-        if (breakout === 'BULLISH' && trend === 'DOWNTREND') {
-          this.logger.info(`${symbol}: BULLISH breakout REJECTED - trend is ${trend}`);
-          return null;
-        }
+        // NOTE: Counter-trend rejection DISABLED - matching Enclave approach
+        // Take breakout signals regardless of MA trend - price action + volume is king
+        this.logger.info(`${symbol}: ${breakout} breakout detected in ${trend} market (trend filter DISABLED)`);
 
-        if (breakout === 'BEARISH' && trend === 'UPTREND') {
-          this.logger.info(`${symbol}: BEARISH breakout REJECTED - trend is ${trend}`);
-          return null;
-        }
-
-        // Reject if price structure doesn't match
+        // Only price structure filters apply - these catch obvious counter-moves
         if (breakout === 'BULLISH' && priceStructure === 'LOWER_LOWS') {
           this.logger.info(`${symbol}: BULLISH breakout REJECTED - price structure shows LOWER_LOWS`);
           return null;
@@ -324,9 +347,26 @@ export class BreakoutStrategy {
           return null;
         }
 
-        // Reject choppy markets
+        // CHOPPY filter removed - RSI + volume + trend filters provide sufficient protection
+        // Keeping this too strict was preventing all trades
         if (priceStructure === 'CHOPPY') {
-          this.logger.info(`${symbol}: ${breakout} signal REJECTED - market is CHOPPY`);
+          this.logger.info(`${symbol}: ${breakout} signal in CHOPPY market - proceeding (RSI/volume will filter)`);
+        }
+
+        // Calculate RSI early for filtering
+        const rsi = TechnicalIndicators.calculateRSI(history);
+
+        // RSI Filter - avoid buying overbought, avoid shorting oversold
+        const RSI_OVERBOUGHT = 70;
+        const RSI_OVERSOLD = 30;
+
+        if (breakout === 'BULLISH' && rsi.greaterThan(RSI_OVERBOUGHT)) {
+          this.logger.info(`${symbol}: BULLISH signal REJECTED - RSI ${rsi.toFixed(2)} > ${RSI_OVERBOUGHT} (overbought)`);
+          return null;
+        }
+
+        if (breakout === 'BEARISH' && rsi.lessThan(RSI_OVERSOLD)) {
+          this.logger.info(`${symbol}: BEARISH signal REJECTED - RSI ${rsi.toFixed(2)} < ${RSI_OVERSOLD} (oversold)`);
           return null;
         }
 
@@ -337,8 +377,6 @@ export class BreakoutStrategy {
           breakout === 'BULLISH'
             ? entryPrice.times(1 - trailingStopPct / 100)
             : entryPrice.times(1 + trailingStopPct / 100);
-
-        const rsi = TechnicalIndicators.calculateRSI(history);
 
         let confidence = 0.7;
 
@@ -393,15 +431,28 @@ export class BreakoutStrategy {
         }
       }
 
-      // Log scan summary when no signal (every 10 scans to avoid spam)
+      // Log scan summary when no signal (every 5 scans for better visibility)
       const scanCount = (this.scanCounts.get(symbol) || 0) + 1;
       this.scanCounts.set(symbol, scanCount);
 
-      if (scanCount % 10 === 0) {
+      if (scanCount % 5 === 0) {
         const lastCandle = history[history.length - 1];
         const volRatio = lastCandle.volume.dividedBy(avgVolume).toFixed(2);
         const distToRes = resistance.minus(currentPrice).dividedBy(currentPrice).times(100).toFixed(2);
         const distToSup = currentPrice.minus(support).dividedBy(currentPrice).times(100).toFixed(2);
+
+        // Check why no signal was generated
+        const breakoutDetected = currentPrice.greaterThan(resistance) || currentPrice.lessThan(support);
+        const volumeOK = parseFloat(volRatio) >= this.config.volumeMultiplier;
+
+        let reason = 'waiting for breakout';
+        if (breakoutDetected && !volumeOK) {
+          reason = `breakout detected but vol too low (${volRatio}x < ${this.config.volumeMultiplier}x)`;
+        } else if (!breakoutDetected && volumeOK) {
+          reason = `vol OK but price in range (${distToRes}% to res, ${distToSup}% to sup)`;
+        } else if (breakoutDetected && volumeOK) {
+          reason = `signal found but filtered (trend: ${trend}, structure: ${priceStructure})`;
+        }
 
         this.logger.info({
           symbol,
@@ -411,9 +462,11 @@ export class BreakoutStrategy {
           distToResistance: `${distToRes}%`,
           distToSupport: `${distToSup}%`,
           volumeRatio: `${volRatio}x`,
+          volumeThreshold: `${this.config.volumeMultiplier}x`,
           trend,
           structure: priceStructure,
-        }, `📊 ${symbol}: No signal - Price $${currentPrice.toFixed(2)}, Trend: ${trend}, Vol: ${volRatio}x avg`);
+          reason,
+        }, `📊 ${symbol}: No signal - ${reason}`);
       }
 
       return null;
