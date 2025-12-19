@@ -670,10 +670,19 @@ export class BreakoutStrategy {
 
       // Initialize trailing stop
       if (signal.side === OrderSide.BUY) {
+        // For longs: track the high, stop is below
         this.trailingStops.set(signal.symbol, {
           high: signal.entryPrice,
           stop: signal.stopLoss,
         });
+        this.logger.info(`Initialized trailing stop for ${signal.symbol} LONG: stop at ${signal.stopLoss.toFixed(2)} (tracking high from ${signal.entryPrice.toFixed(2)})`);
+      } else {
+        // For shorts: track the low (stored in 'high' field), stop is above
+        this.trailingStops.set(signal.symbol, {
+          high: signal.entryPrice, // This is the LOW for shorts
+          stop: signal.stopLoss,   // Stop is above entry for shorts
+        });
+        this.logger.info(`Initialized trailing stop for ${signal.symbol} SHORT: stop at ${signal.stopLoss.toFixed(2)} (tracking low from ${signal.entryPrice.toFixed(2)})`);
       }
 
       // Notify via Telegram
@@ -703,14 +712,26 @@ export class BreakoutStrategy {
       const positions = await this.client.getPositions();
 
       for (const position of positions) {
-        const signal = this.activeSignals.get(position.symbol);
-        if (!signal) {
-          continue;
-        }
+        let trailingStop = this.trailingStops.get(position.symbol);
 
-        const trailingStop = this.trailingStops.get(position.symbol);
+        // Initialize trailing stop for orphan positions (positions without tracking)
         if (!trailingStop) {
-          continue;
+          const stopPercent = this.getTrailingStopPercent(position.symbol);
+          if (position.side === OrderSide.BUY) {
+            // For longs: stop is below entry
+            trailingStop = {
+              high: position.entryPrice,
+              stop: position.entryPrice.times(1 - stopPercent / 100),
+            };
+          } else {
+            // For shorts: stop is above entry
+            trailingStop = {
+              high: position.entryPrice, // This is the LOW for shorts
+              stop: position.entryPrice.times(1 + stopPercent / 100),
+            };
+          }
+          this.trailingStops.set(position.symbol, trailingStop);
+          this.logger.info(`Initialized trailing stop for orphan ${position.symbol} ${position.side}: stop at ${trailingStop.stop.toFixed(2)} (${stopPercent}% from entry ${position.entryPrice.toFixed(2)})`);
         }
 
         // Update trailing stop for longs
@@ -719,23 +740,42 @@ export class BreakoutStrategy {
             trailingStop.high = position.markPrice;
             trailingStop.stop = position.markPrice.times(1 - this.getTrailingStopPercent(position.symbol) / 100);
             this.trailingStops.set(position.symbol, trailingStop);
-            this.logger.info(`Updated trailing stop for ${position.symbol}: ${trailingStop.stop.toFixed(2)} (${this.getTrailingStopPercent(position.symbol)}% tiered stop)`);
+            this.logger.info(`Updated trailing stop for ${position.symbol} LONG: stop at ${trailingStop.stop.toFixed(2)} (${this.getTrailingStopPercent(position.symbol)}% below high of ${trailingStop.high.toFixed(2)})`);
           }
 
-          // Check if stop hit
+          // Check if stop hit (price dropped below stop)
           if (position.markPrice.lessThanOrEqualTo(trailingStop.stop)) {
-            this.logger.info(`🛑 Trailing stop hit for ${position.symbol}`);
+            this.logger.info(`🛑 Trailing stop hit for ${position.symbol} LONG at ${position.markPrice.toFixed(2)}`);
             await this.closePosition(position.symbol, 'Trailing stop hit');
           }
         }
 
-        // Check take profit
-        if (signal.takeProfit) {
+        // Update trailing stop for shorts
+        if (position.side === OrderSide.SELL) {
+          // For shorts, we track the LOW and stop is ABOVE it
+          // trailingStop.high is repurposed as "low" for shorts
+          if (position.markPrice.lessThan(trailingStop.high)) {
+            trailingStop.high = position.markPrice; // This is actually the LOW for shorts
+            trailingStop.stop = position.markPrice.times(1 + this.getTrailingStopPercent(position.symbol) / 100);
+            this.trailingStops.set(position.symbol, trailingStop);
+            this.logger.info(`Updated trailing stop for ${position.symbol} SHORT: stop at ${trailingStop.stop.toFixed(2)} (${this.getTrailingStopPercent(position.symbol)}% above low of ${trailingStop.high.toFixed(2)})`);
+          }
+
+          // Check if stop hit (price rose above stop)
+          if (position.markPrice.greaterThanOrEqualTo(trailingStop.stop)) {
+            this.logger.info(`🛑 Trailing stop hit for ${position.symbol} SHORT at ${position.markPrice.toFixed(2)}`);
+            await this.closePosition(position.symbol, 'Trailing stop hit');
+          }
+        }
+
+        // Check take profit (only if we have an active signal with take profit)
+        const signal = this.activeSignals.get(position.symbol);
+        if (signal?.takeProfit) {
           if (position.side === OrderSide.BUY && position.markPrice.greaterThanOrEqualTo(signal.takeProfit)) {
-            this.logger.info(`🎯 Take profit hit for ${position.symbol}`);
+            this.logger.info(`🎯 Take profit hit for ${position.symbol} at ${position.markPrice.toFixed(2)}`);
             await this.closePosition(position.symbol, 'Take profit target reached');
           } else if (position.side === OrderSide.SELL && position.markPrice.lessThanOrEqualTo(signal.takeProfit)) {
-            this.logger.info(`🎯 Take profit hit for ${position.symbol}`);
+            this.logger.info(`🎯 Take profit hit for ${position.symbol} at ${position.markPrice.toFixed(2)}`);
             await this.closePosition(position.symbol, 'Take profit target reached');
           }
         }
