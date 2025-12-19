@@ -714,7 +714,7 @@ export class BreakoutStrategy {
       for (const position of positions) {
         let trailingStop = this.trailingStops.get(position.symbol);
 
-        // Initialize trailing stop for orphan positions (positions without tracking)
+        // Initialize trailing stop and take profit for orphan positions (positions without tracking)
         if (!trailingStop) {
           const stopPercent = this.getTrailingStopPercent(position.symbol);
           if (position.side === OrderSide.BUY) {
@@ -732,6 +732,31 @@ export class BreakoutStrategy {
           }
           this.trailingStops.set(position.symbol, trailingStop);
           this.logger.info(`Initialized trailing stop for orphan ${position.symbol} ${position.side}: stop at ${trailingStop.stop.toFixed(2)} (${stopPercent}% from entry ${position.entryPrice.toFixed(2)})`);
+
+          // Also create a synthetic signal with take profit for orphan positions
+          if (!this.activeSignals.has(position.symbol) && this.config.takeProfitPercent) {
+            const takeProfitPercent = this.config.takeProfitPercent;
+            let takeProfit: Decimal;
+            if (position.side === OrderSide.BUY) {
+              // For longs: take profit is above entry
+              takeProfit = position.entryPrice.times(1 + takeProfitPercent / 100);
+            } else {
+              // For shorts: take profit is below entry
+              takeProfit = position.entryPrice.times(1 - takeProfitPercent / 100);
+            }
+
+            const syntheticSignal: Signal = {
+              symbol: position.symbol,
+              side: position.side === OrderSide.BUY ? OrderSide.BUY : OrderSide.SELL,
+              entryPrice: position.entryPrice,
+              stopLoss: trailingStop.stop,
+              takeProfit: takeProfit,
+              confidence: 0.5, // Unknown confidence for recovered positions
+              reason: 'Recovered orphan position',
+            };
+            this.activeSignals.set(position.symbol, syntheticSignal);
+            this.logger.info(`Initialized take profit for orphan ${position.symbol} ${position.side}: TP at ${takeProfit.toFixed(2)} (${takeProfitPercent}% from entry ${position.entryPrice.toFixed(2)})`);
+          }
         }
 
         // Update trailing stop for longs
