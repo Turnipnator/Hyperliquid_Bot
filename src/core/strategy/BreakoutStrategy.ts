@@ -41,7 +41,9 @@ export class BreakoutStrategy {
   private trendHistory: Map<string, Array<'UPTREND' | 'DOWNTREND' | 'SIDEWAYS'>> = new Map();
   private stopLossCooldowns: Map<string, number> = new Map();
   private scanCounts: Map<string, number> = new Map();
+  private recentlyClosedPositions: Map<string, number> = new Map(); // Prevents duplicate close attempts
   private readonly STOP_LOSS_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
+  private readonly CLOSE_POSITION_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes to avoid duplicate closes
 
   /**
    * Get trailing stop percentage - flat 5% for all pairs
@@ -693,6 +695,19 @@ export class BreakoutStrategy {
       const positions = await this.client.getPositions();
 
       for (const position of positions) {
+        // Skip positions that were recently closed (prevents duplicate close attempts)
+        const closedTimestamp = this.recentlyClosedPositions.get(position.symbol);
+        if (closedTimestamp) {
+          const elapsed = Date.now() - closedTimestamp;
+          if (elapsed < this.CLOSE_POSITION_COOLDOWN_MS) {
+            this.logger.debug(`Skipping ${position.symbol} - position was closed ${Math.round(elapsed / 1000)}s ago, waiting for settlement`);
+            continue;
+          } else {
+            // Cooldown expired, remove from recently closed
+            this.recentlyClosedPositions.delete(position.symbol);
+          }
+        }
+
         let trailingStop = this.trailingStops.get(position.symbol);
 
         // Initialize trailing stop and take profit for orphan positions (positions without tracking)
@@ -793,6 +808,13 @@ export class BreakoutStrategy {
 
   public async closePosition(symbol: string, reason: string): Promise<void> {
     try {
+      // Check if we recently tried to close this position (prevents duplicate notifications)
+      const recentClose = this.recentlyClosedPositions.get(symbol);
+      if (recentClose && Date.now() - recentClose < this.CLOSE_POSITION_COOLDOWN_MS) {
+        this.logger.debug(`Skipping close for ${symbol} - already closed ${Math.round((Date.now() - recentClose) / 1000)}s ago`);
+        return;
+      }
+
       const positions = await this.client.getPositions();
       const position = positions.find(p => p.symbol === symbol);
 
@@ -813,6 +835,9 @@ export class BreakoutStrategy {
         OrderType.LIMIT,
         true // reduce-only
       );
+
+      // Mark position as recently closed to prevent duplicate close attempts
+      this.recentlyClosedPositions.set(symbol, Date.now());
 
       // Notify
       if (this.telegram) {
