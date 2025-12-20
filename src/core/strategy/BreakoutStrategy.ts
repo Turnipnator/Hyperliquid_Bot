@@ -44,30 +44,11 @@ export class BreakoutStrategy {
   private readonly STOP_LOSS_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
 
   /**
-   * Get trailing stop percentage based on 90-day volatility analysis
-   * Tiered stops to match each pair's ATR (Average True Range):
-   * - Low volatility (BTC/ETH/BNB): 6% - ATR ~3-5.5%
-   * - Medium volatility (SOL/XRP): 8% - ATR ~6-6.5%
-   * - High volatility (LINK/AVAX/SUI/HYPE): 10% - ATR ~7.5-8.5%
+   * Get trailing stop percentage - flat 5% for all pairs
+   * Matches Binance/Enclave bot configuration for consistency
    */
-  private getTrailingStopPercent(symbol: string): number {
-    // Low volatility tier - 6% stop (~1.5x their ATR)
-    if (symbol === 'BTC' || symbol === 'ETH' || symbol === 'BNB') {
-      return 6;
-    }
-
-    // Medium volatility tier - 8% stop (~1.3x their ATR)
-    if (symbol === 'SOL' || symbol === 'XRP') {
-      return 8;
-    }
-
-    // High volatility tier - 10% stop (~1.3x their ATR)
-    if (symbol === 'LINK' || symbol === 'AVAX' || symbol === 'SUI' || symbol === 'HYPE') {
-      return 10;
-    }
-
-    // Default to config value for unknown pairs
-    return this.config.trailingStopPercent;
+  private getTrailingStopPercent(_symbol: string): number {
+    return 5;
   }
 
   constructor(client: HyperliquidClient, strategyConfig: BreakoutConfig, telegram?: TelegramService) {
