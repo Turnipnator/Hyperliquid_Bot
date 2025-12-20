@@ -29,7 +29,17 @@ class HyperliquidBot implements BotStatusProvider {
       environment: config.environment,
     });
 
-    // Initialize strategy
+    // Initialize Telegram FIRST so it can be passed to strategy
+    if (config.telegramEnabled && config.telegramBotToken && config.telegramChatId) {
+      this.telegram = new TelegramService({
+        botToken: config.telegramBotToken,
+        chatId: config.telegramChatId,
+        enabled: true,
+      });
+      this.telegram.setStatusProvider(this);
+    }
+
+    // Initialize strategy WITH Telegram for notifications
     this.strategy = new BreakoutStrategy(
       this.client,
       {
@@ -40,7 +50,8 @@ class HyperliquidBot implements BotStatusProvider {
         useScalping: config.useScalping,
         breakoutBuffer: config.breakoutBuffer,
         takeProfitPercent: config.takeProfitPercent,
-      }
+      },
+      this.telegram  // Pass Telegram service to strategy
     );
 
     // Initialize risk manager
@@ -51,16 +62,6 @@ class HyperliquidBot implements BotStatusProvider {
       maxLeverage: config.maxLeverage,
       maxDrawdown: config.maxDrawdown,
     });
-
-    // Initialize Telegram if enabled
-    if (config.telegramEnabled && config.telegramBotToken && config.telegramChatId) {
-      this.telegram = new TelegramService({
-        botToken: config.telegramBotToken,
-        chatId: config.telegramChatId,
-        enabled: true,
-      });
-      this.telegram.setStatusProvider(this);
-    }
 
     // Initialize Binance data service
     this.binanceData = new BinanceDataService(config.binanceBaseUrl);
