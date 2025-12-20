@@ -240,4 +240,66 @@ export class TechnicalIndicators {
       return maTrend === 'DOWNTREND' && structure === 'LOWER_LOWS';
     }
   }
+
+  /**
+   * Check if EMAs are properly aligned for trend confirmation
+   * Matches Binance_Bot's stricter filtering approach
+   *
+   * For BULLISH: price > EMA9 > EMA21 > EMA50 (all stacked in order)
+   * For BEARISH: price < EMA9 < EMA21 < EMA50 (all stacked in order)
+   */
+  public static isEmaAligned(
+    prices: PriceData[],
+    direction: 'BULLISH' | 'BEARISH'
+  ): { aligned: boolean; reason: string } {
+    if (prices.length < 50) {
+      return { aligned: false, reason: 'Insufficient data for EMA alignment' };
+    }
+
+    const closePrices = prices.map(p => p.close);
+    const currentPrice = closePrices[closePrices.length - 1];
+
+    // Calculate EMAs (9, 21, 50 periods - common fast/medium/slow setup)
+    const ema9 = this.calculateEMA(closePrices, 9);
+    const ema21 = this.calculateEMA(closePrices, 21);
+    const ema50 = this.calculateEMA(closePrices, 50);
+
+    if (direction === 'BULLISH') {
+      // For bullish: price > EMA9 > EMA21 > EMA50
+      const priceAboveEma9 = currentPrice.greaterThan(ema9);
+      const ema9AboveEma21 = ema9.greaterThan(ema21);
+      const ema21AboveEma50 = ema21.greaterThan(ema50);
+
+      if (priceAboveEma9 && ema9AboveEma21 && ema21AboveEma50) {
+        return { aligned: true, reason: 'EMAs bullish aligned: P > EMA9 > EMA21 > EMA50' };
+      }
+
+      // Provide specific rejection reason
+      if (!priceAboveEma9) {
+        return { aligned: false, reason: `Price ${currentPrice.toFixed(2)} below EMA9 ${ema9.toFixed(2)}` };
+      }
+      if (!ema9AboveEma21) {
+        return { aligned: false, reason: `EMA9 ${ema9.toFixed(2)} below EMA21 ${ema21.toFixed(2)}` };
+      }
+      return { aligned: false, reason: `EMA21 ${ema21.toFixed(2)} below EMA50 ${ema50.toFixed(2)}` };
+    } else {
+      // For bearish: price < EMA9 < EMA21 < EMA50
+      const priceBelowEma9 = currentPrice.lessThan(ema9);
+      const ema9BelowEma21 = ema9.lessThan(ema21);
+      const ema21BelowEma50 = ema21.lessThan(ema50);
+
+      if (priceBelowEma9 && ema9BelowEma21 && ema21BelowEma50) {
+        return { aligned: true, reason: 'EMAs bearish aligned: P < EMA9 < EMA21 < EMA50' };
+      }
+
+      // Provide specific rejection reason
+      if (!priceBelowEma9) {
+        return { aligned: false, reason: `Price ${currentPrice.toFixed(2)} above EMA9 ${ema9.toFixed(2)}` };
+      }
+      if (!ema9BelowEma21) {
+        return { aligned: false, reason: `EMA9 ${ema9.toFixed(2)} above EMA21 ${ema21.toFixed(2)}` };
+      }
+      return { aligned: false, reason: `EMA21 ${ema21.toFixed(2)} above EMA50 ${ema50.toFixed(2)}` };
+    }
+  }
 }

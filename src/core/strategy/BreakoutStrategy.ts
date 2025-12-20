@@ -291,10 +291,8 @@ export class BreakoutStrategy {
         }
 
         if (signalType && volumeOK) {
-          // NOTE: Trend alignment DISABLED - matching Enclave approach exactly
-          // Price action + volume is sufficient confirmation
-          // Only price structure filters are used (LOWER_LOWS, HIGHER_HIGHS, CHOPPY)
-          this.logger.debug(`${symbol}: ${signalType} signal found in ${trend} market - trend filter DISABLED`);
+          // Signal found - will be validated by strict trend + EMA filters later
+          this.logger.debug(`${symbol}: ${signalType} signal found in ${trend} market - pending trend/EMA validation`);
 
           // Check if price action still valid
           if (signalType === 'BULLISH' && currentPrice.greaterThan(support)) {
@@ -315,11 +313,31 @@ export class BreakoutStrategy {
       const volumeSpike = breakoutCandle !== null;
 
       if (breakout && volumeSpike && breakoutCandle) {
-        // NOTE: Counter-trend rejection DISABLED - matching Enclave approach
-        // Take breakout signals regardless of MA trend - price action + volume is king
-        this.logger.info(`${symbol}: ${breakout} breakout detected in ${trend} market (trend filter DISABLED)`);
+        this.logger.info(`${symbol}: ${breakout} breakout detected in ${trend} market`);
 
-        // Only price structure filters apply - these catch obvious counter-moves
+        // STRICT TREND FILTER - Matching Binance_Bot approach
+        // Require trend alignment for all signals (prevents counter-trend entries)
+        if (breakout === 'BULLISH' && trend !== 'UPTREND') {
+          this.logger.info(`${symbol}: BULLISH breakout REJECTED - trend is ${trend}, need UPTREND`);
+          return null;
+        }
+
+        if (breakout === 'BEARISH' && trend !== 'DOWNTREND') {
+          this.logger.info(`${symbol}: BEARISH breakout REJECTED - trend is ${trend}, need DOWNTREND`);
+          return null;
+        }
+
+        // EMA STACKING CHECK - Matching Binance_Bot's stricter filtering
+        // For BULLISH: price > EMA9 > EMA21 > EMA50
+        // For BEARISH: price < EMA9 < EMA21 < EMA50
+        const emaCheck = TechnicalIndicators.isEmaAligned(history, breakout);
+        if (!emaCheck.aligned) {
+          this.logger.info(`${symbol}: ${breakout} breakout REJECTED - ${emaCheck.reason}`);
+          return null;
+        }
+        this.logger.info(`${symbol}: EMA alignment confirmed - ${emaCheck.reason}`);
+
+        // Price structure filters - reject obvious counter-moves
         if (breakout === 'BULLISH' && priceStructure === 'LOWER_LOWS') {
           this.logger.info(`${symbol}: BULLISH breakout REJECTED - price structure shows LOWER_LOWS`);
           return null;
@@ -330,10 +348,9 @@ export class BreakoutStrategy {
           return null;
         }
 
-        // CHOPPY filter removed - RSI + volume + trend filters provide sufficient protection
-        // Keeping this too strict was preventing all trades
+        // CHOPPY market filter - be cautious in ranging markets
         if (priceStructure === 'CHOPPY') {
-          this.logger.info(`${symbol}: ${breakout} signal in CHOPPY market - proceeding (RSI/volume will filter)`);
+          this.logger.info(`${symbol}: ${breakout} signal in CHOPPY market - extra caution (trend+EMA confirmed)`);
         }
 
         // Calculate RSI early for filtering
@@ -392,10 +409,10 @@ export class BreakoutStrategy {
           stopLoss,
           takeProfit,
           confidence,
-          reason: `${breakout} breakout in ${trend}, ${priceStructure} structure, vol spike, RSI: ${rsi.toFixed(2)}`,
+          reason: `${breakout} breakout in ${trend}, ${priceStructure} structure, EMA aligned, vol spike, RSI: ${rsi.toFixed(2)}`,
         };
 
-        this.logger.info({ signal }, `✅ Signal generated for ${symbol}: ${side} in ${trend}`);
+        this.logger.info({ signal }, `✅ Signal generated for ${symbol}: ${side} in ${trend} (EMA aligned)`);
         return signal;
       }
 
