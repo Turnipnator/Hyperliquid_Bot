@@ -348,9 +348,10 @@ export class BreakoutStrategy {
           return null;
         }
 
-        // CHOPPY market filter - be cautious in ranging markets
+        // CHOPPY market filter - reject ranging markets like Binance_Bot
         if (priceStructure === 'CHOPPY') {
-          this.logger.info(`${symbol}: ${breakout} signal in CHOPPY market - extra caution (trend+EMA confirmed)`);
+          this.logger.info(`${symbol}: ${breakout} breakout REJECTED - price structure is CHOPPY (ranging market)`);
+          return null;
         }
 
         // Calculate RSI early for filtering
