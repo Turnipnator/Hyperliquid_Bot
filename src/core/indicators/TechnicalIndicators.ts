@@ -242,12 +242,125 @@ export class TechnicalIndicators {
   }
 
   /**
-   * Check if EMAs are properly aligned for trend confirmation
-   * Matches Binance_Bot's stricter filtering approach
-   *
-   * For BULLISH: price > EMA9 > EMA21 > EMA50 (all stacked in order)
-   * For BEARISH: price < EMA9 < EMA21 < EMA50 (all stacked in order)
+   * Calculate MACD (Moving Average Convergence Divergence)
+   * Returns MACD line, signal line, and histogram
    */
+  public static calculateMACD(
+    prices: PriceData[],
+    fastPeriod = 12,
+    slowPeriod = 26,
+    signalPeriod = 9
+  ): { macd: Decimal; signal: Decimal; histogram: Decimal } {
+    if (prices.length < slowPeriod + signalPeriod) {
+      throw new Error(`Insufficient data for MACD calculation`);
+    }
+
+    const closePrices = prices.map(p => p.close);
+
+    // Calculate fast and slow EMAs
+    const fastEma = this.calculateEMA(closePrices, fastPeriod);
+    const slowEma = this.calculateEMA(closePrices, slowPeriod);
+
+    // MACD line = fast EMA - slow EMA
+    const macdLine = fastEma.minus(slowEma);
+
+    // For signal line, we need historical MACD values
+    // Calculate MACD for each point and then EMA of those
+    const macdHistory: Decimal[] = [];
+    for (let i = slowPeriod; i <= closePrices.length; i++) {
+      const slice = closePrices.slice(0, i);
+      const fast = this.calculateEMA(slice, fastPeriod);
+      const slow = this.calculateEMA(slice, slowPeriod);
+      macdHistory.push(fast.minus(slow));
+    }
+
+    // Signal line = EMA of MACD line
+    const signalLine = macdHistory.length >= signalPeriod
+      ? this.calculateEMA(macdHistory, signalPeriod)
+      : macdLine;
+
+    // Histogram = MACD - Signal
+    const histogram = macdLine.minus(signalLine);
+
+    return {
+      macd: macdLine,
+      signal: signalLine,
+      histogram: histogram
+    };
+  }
+
+  /**
+   * Check if MACD confirms trend direction
+   * For BULLISH: MACD > Signal AND Histogram > 0
+   * For BEARISH: MACD < Signal AND Histogram < 0
+   */
+  public static isMacdAligned(
+    prices: PriceData[],
+    direction: 'BULLISH' | 'BEARISH'
+  ): { aligned: boolean; reason: string; macd: Decimal; signal: Decimal; histogram: Decimal } {
+    try {
+      const { macd, signal, histogram } = this.calculateMACD(prices);
+
+      if (direction === 'BULLISH') {
+        const macdAboveSignal = macd.greaterThan(signal);
+        const histogramPositive = histogram.greaterThan(0);
+
+        if (macdAboveSignal && histogramPositive) {
+          return {
+            aligned: true,
+            reason: `MACD bullish: ${macd.toFixed(4)} > ${signal.toFixed(4)}, hist ${histogram.toFixed(4)}`,
+            macd, signal, histogram
+          };
+        }
+
+        if (!macdAboveSignal) {
+          return {
+            aligned: false,
+            reason: `MACD ${macd.toFixed(4)} below signal ${signal.toFixed(4)}`,
+            macd, signal, histogram
+          };
+        }
+        return {
+          aligned: false,
+          reason: `MACD histogram negative: ${histogram.toFixed(4)}`,
+          macd, signal, histogram
+        };
+      } else {
+        const macdBelowSignal = macd.lessThan(signal);
+        const histogramNegative = histogram.lessThan(0);
+
+        if (macdBelowSignal && histogramNegative) {
+          return {
+            aligned: true,
+            reason: `MACD bearish: ${macd.toFixed(4)} < ${signal.toFixed(4)}, hist ${histogram.toFixed(4)}`,
+            macd, signal, histogram
+          };
+        }
+
+        if (!macdBelowSignal) {
+          return {
+            aligned: false,
+            reason: `MACD ${macd.toFixed(4)} above signal ${signal.toFixed(4)}`,
+            macd, signal, histogram
+          };
+        }
+        return {
+          aligned: false,
+          reason: `MACD histogram positive: ${histogram.toFixed(4)}`,
+          macd, signal, histogram
+        };
+      }
+    } catch (error) {
+      return {
+        aligned: false,
+        reason: 'Insufficient data for MACD',
+        macd: new Decimal(0),
+        signal: new Decimal(0),
+        histogram: new Decimal(0)
+      };
+    }
+  }
+
   public static isEmaAligned(
     prices: PriceData[],
     direction: 'BULLISH' | 'BEARISH'

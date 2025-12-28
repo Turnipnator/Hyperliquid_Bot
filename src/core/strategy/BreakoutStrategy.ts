@@ -42,8 +42,11 @@ export class BreakoutStrategy {
   private stopLossCooldowns: Map<string, number> = new Map();
   private scanCounts: Map<string, number> = new Map();
   private recentlyClosedPositions: Map<string, number> = new Map(); // Prevents duplicate close attempts
+  private lastMacdState: Map<string, { macd: Decimal; signal: Decimal }> = new Map(); // Track MACD for cross detection
   private readonly STOP_LOSS_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
   private readonly CLOSE_POSITION_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes to avoid duplicate closes
+  private readonly RSI_EXIT_OVERBOUGHT = 75; // Exit longs when RSI > 75
+  private readonly RSI_EXIT_OVERSOLD = 25; // Exit shorts when RSI < 25
 
   /**
    * Get trailing stop percentage - flat 5% for all pairs
@@ -336,6 +339,16 @@ export class BreakoutStrategy {
           return null;
         }
         this.logger.info(`${symbol}: EMA alignment confirmed - ${emaCheck.reason}`);
+
+        // MACD FILTER - Matching Binance_Bot
+        // For BULLISH: MACD > Signal AND Histogram > 0
+        // For BEARISH: MACD < Signal AND Histogram < 0
+        const macdCheck = TechnicalIndicators.isMacdAligned(history, breakout);
+        if (!macdCheck.aligned) {
+          this.logger.info(`${symbol}: ${breakout} breakout REJECTED - ${macdCheck.reason}`);
+          return null;
+        }
+        this.logger.info(`${symbol}: MACD confirmed - ${macdCheck.reason}`);
 
         // Price structure filters - reject obvious counter-moves
         if (breakout === 'BULLISH' && priceStructure === 'LOWER_LOWS') {
@@ -813,9 +826,68 @@ export class BreakoutStrategy {
           if (position.side === OrderSide.BUY && position.markPrice.greaterThanOrEqualTo(signal.takeProfit)) {
             this.logger.info(`🎯 Take profit hit for ${position.symbol} at ${position.markPrice.toFixed(2)}`);
             await this.closePosition(position.symbol, 'Take profit target reached');
+            continue;
           } else if (position.side === OrderSide.SELL && position.markPrice.lessThanOrEqualTo(signal.takeProfit)) {
             this.logger.info(`🎯 Take profit hit for ${position.symbol} at ${position.markPrice.toFixed(2)}`);
             await this.closePosition(position.symbol, 'Take profit target reached');
+            continue;
+          }
+        }
+
+        // EARLY EXIT CONDITIONS - Matching Binance_Bot
+        // Check RSI and MACD for early exit signals
+        const history = this.priceHistory.get(position.symbol);
+        if (history && history.length >= 35) {
+          // RSI Exit - Exit longs when overbought, exit shorts when oversold
+          try {
+            const rsi = TechnicalIndicators.calculateRSI(history);
+
+            if (position.side === OrderSide.BUY && rsi.greaterThan(this.RSI_EXIT_OVERBOUGHT)) {
+              this.logger.info(`📈 RSI exit for ${position.symbol} LONG: RSI ${rsi.toFixed(2)} > ${this.RSI_EXIT_OVERBOUGHT}`);
+              await this.closePosition(position.symbol, `RSI overbought exit (${rsi.toFixed(1)})`);
+              continue;
+            }
+
+            if (position.side === OrderSide.SELL && rsi.lessThan(this.RSI_EXIT_OVERSOLD)) {
+              this.logger.info(`📉 RSI exit for ${position.symbol} SHORT: RSI ${rsi.toFixed(2)} < ${this.RSI_EXIT_OVERSOLD}`);
+              await this.closePosition(position.symbol, `RSI oversold exit (${rsi.toFixed(1)})`);
+              continue;
+            }
+          } catch (e) {
+            // RSI calculation failed, skip this check
+          }
+
+          // MACD Cross Exit - Exit on bearish cross (for longs) or bullish cross (for shorts)
+          try {
+            const { macd, signal: macdSignal } = TechnicalIndicators.calculateMACD(history);
+            const lastState = this.lastMacdState.get(position.symbol);
+
+            if (lastState) {
+              // Check for MACD cross
+              const wasMacdAboveSignal = lastState.macd.greaterThan(lastState.signal);
+              const isMacdAboveSignal = macd.greaterThan(macdSignal);
+
+              // Bearish cross: MACD was above signal, now below
+              if (position.side === OrderSide.BUY && wasMacdAboveSignal && !isMacdAboveSignal) {
+                this.logger.info(`📉 MACD bearish cross for ${position.symbol} LONG - exiting`);
+                await this.closePosition(position.symbol, 'MACD bearish crossover');
+                this.lastMacdState.delete(position.symbol);
+                continue;
+              }
+
+              // Bullish cross: MACD was below signal, now above
+              if (position.side === OrderSide.SELL && !wasMacdAboveSignal && isMacdAboveSignal) {
+                this.logger.info(`📈 MACD bullish cross for ${position.symbol} SHORT - exiting`);
+                await this.closePosition(position.symbol, 'MACD bullish crossover');
+                this.lastMacdState.delete(position.symbol);
+                continue;
+              }
+            }
+
+            // Update last MACD state for next iteration
+            this.lastMacdState.set(position.symbol, { macd, signal: macdSignal });
+          } catch (e) {
+            // MACD calculation failed, skip this check
           }
         }
       }
