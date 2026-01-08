@@ -6,9 +6,9 @@
 
 2. **NEVER rebuild with --no-cache** - This broke the EIP-712 signing in the past by pulling incompatible dependencies. Always use normal `docker compose build`.
 
-3. **Always backup before significant changes** - Create a backup on VPS before modifying core logic.
+3. **Always backup before significant changes** - Create a backup before modifying core logic.
 
-4. **Test on VPS after changes** - Always verify the container is healthy after deployment.
+4. **Test after changes** - Always verify the container is healthy after deployment.
 
 ---
 
@@ -118,42 +118,8 @@ LOG_LEVEL=info
 
 ## VPS Deployment
 
-### Server Details
-- **VPS**: Contabo (same as other bots)
-- **IP**: 109.199.105.63
-- **Path**: /opt/hyperliquid-bot
-- **Container**: hyperliquid-trading-bot
-
-### SSH Access
-```bash
-ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63
-```
-
-### Standard Deploy (after code changes)
-```bash
-# 1. Commit and push locally
-git add . && git commit -m "message" && git push origin main
-
-# 2. Sync VPS and rebuild (NEVER use --no-cache)
-ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63 "cd /opt/hyperliquid-bot && git fetch origin main && git reset --hard origin/main && docker compose down && docker compose build && docker compose up -d"
-```
-
-### Quick Restart (no code changes)
-```bash
-ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63 "cd /opt/hyperliquid-bot && docker compose restart"
-```
-
-### Check Status
-```bash
-# Container health
-ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63 "docker ps | grep hyperliquid"
-
-# Recent logs
-ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63 "docker logs --tail 50 hyperliquid-trading-bot"
-
-# Check for errors
-ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63 "docker logs hyperliquid-trading-bot 2>&1 | grep -i error | tail -10"
-```
+See `CLAUDE.local.md` for VPS connection details and deployment commands.
+This file is gitignored and contains sensitive server information.
 
 ---
 
@@ -275,14 +241,14 @@ docker logs --tail 100 hyperliquid-trading-bot
 
 ---
 
-## Other Bots on Same VPS
+## Other Bots
 
-For reference:
-- **Binance Bot**: /opt/Binance_Bot (Python, most mature)
-- **Enclave Bot**: /opt/enclave-bot (TypeScript)
-- **Gold Bot**: /opt/Oanda_Gold
+For reference, other bots use similar patterns:
+- **Binance Bot**: Python, most mature, same momentum approach
+- **Enclave Bot**: TypeScript, similar strategy
+- **Gold Bot**: Oanda forex
 
-All use similar patterns: Docker Compose, Telegram notifications.
+All use: Docker Compose, Telegram notifications.
 
 ---
 
