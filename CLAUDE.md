@@ -1,94 +1,59 @@
-# Hyperliquid Trading Bot - CLAUDE.md
+# Hyperliquid Trading Bot - Claude Code Instructions
 
-You're a world class trader with a dark sense of humour, you're ruthless at making money in the markets and this project is your bot to rake in the cash. Be optimistic, assume you have implemented it wrong until tests prove otherwise.
+## CRITICAL RULES
+
+1. **DO NOT modify the core strategy** without explicit request - The breakout strategy with volume confirmation is working. Don't change unless asked.
+
+2. **NEVER rebuild with --no-cache** - This broke the EIP-712 signing in the past by pulling incompatible dependencies. Always use normal `docker compose build`.
+
+3. **Always backup before significant changes** - Create a backup on VPS before modifying core logic.
+
+4. **Test on VPS after changes** - Always verify the container is healthy after deployment.
+
+---
 
 ## Project Overview
-Automated breakout trading bot for Hyperliquid Markets crypto perpetuals exchange. Implements a breakout strategy with volume confirmation, take profit, stop loss and trailing stops. You will only trade BTC, AVAX, HYPE, ETH, SOL, BNB, SUI, LINK & XRP until told otherwise.
 
-**Documentation**: https://app.hyperliquid.xyz/trade
-**API**: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
-**Testnet**: https://app.hyperliquid-testnet.xyz/trade
-**Referral**: https://app.hyperliquid.xyz/join/JOSHH
+Automated breakout trading bot for Hyperliquid perpetuals exchange. Uses wallet signing (EIP-712) for authentication and Binance for historical candle data.
 
-## Development Commands
+### Current Configuration
+- **Position Size**: $75 per trade
+- **Max Positions**: 6 concurrent
+- **Volume Multiplier**: 1.5x average
+- **Trailing Stop**: 5%
+- **Max Daily Loss**: $30
+- **Trading Pairs**: BTC, ETH, SOL, AVAX, HYPE, BNB, SUI, LINK, XRP
 
-### Setup & Installation
-```bash
-pnpm install              # Install dependencies
-pnpm build               # Build TypeScript
-pnpm dev                 # Run in development mode with hot-reload
+---
+
+## Project Structure
+
+```
+hyperliquid-bot/
+├── src/
+│   ├── index.ts                    # Main entry point
+│   ├── core/
+│   │   ├── exchange/
+│   │   │   └── HyperliquidClient.ts  # API client with EIP-712 signing
+│   │   ├── strategy/
+│   │   │   └── BreakoutStrategy.ts   # Main strategy logic
+│   │   ├── indicators/               # Technical indicators
+│   │   └── risk/                     # Risk management
+│   ├── services/
+│   │   ├── data/
+│   │   │   └── BinanceDataService.ts # Historical candle data
+│   │   └── telegram/                 # Telegram notifications
+│   ├── config/                       # Configuration
+│   └── utils/                        # Utilities
+├── logs/                             # Log files (mounted volume)
+├── docker-compose.yml                # Container configuration
+├── Dockerfile                        # Build instructions
+├── .env                              # Secrets and config (not in git)
+├── package.json                      # Dependencies
+└── tsconfig.json                     # TypeScript config
 ```
 
-### Testing
-```bash
-pnpm test                # Run all tests
-pnpm test:unit           # Unit tests only
-pnpm test:integration    # Integration tests
-pnpm test:coverage       # Generate coverage report
-```
-
-### Linting & Type Checking
-```bash
-pnpm lint                # Run ESLint
-pnpm typecheck           # Run TypeScript type checking
-pnpm format              # Format code with Prettier
-```
-
-### Running the Bot
-```bash
-pnpm start               # Production mode
-pnpm start:paper         # Paper trading mode (simulated trades)
-pnpm start:live          # Live trading with real funds
-pnpm dev                 # Development mode with hot-reload
-```
-
-## Configuration
-
-### Environment Variables
-Create `.env` file with:
-```
-HYPERLIQUID_PRIVATE_KEY=0x...            # Your wallet private key
-HYPERLIQUID_ACCOUNT_ADDRESS=0x...        # Your wallet address
-HYPERLIQUID_ENV=TESTNET                  # or MAINNET
-LOG_LEVEL=info                           # debug, info, warn, error
-TRADING_MODE=paper                       # paper or live
-MAX_DAILY_LOSS=100                       # Maximum daily loss in USD
-POSITION_SIZE=10                         # Default position size in USD
-TRADING_PAIRS=BTC,ETH,SOL,AVAX,HYPE,BNB,SUI,LINK,XRP
-
-# Telegram (optional)
-TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_CHAT_ID=your_chat_id
-TELEGRAM_ENABLED=true
-```
-
-### Strategy Parameters (in .env)
-- `LOOKBACK_PERIOD`: Days for resistance/support calculation (default: 10)
-- `VOLUME_MULTIPLIER`: Volume spike threshold (default: 1.5)
-- `TRAILING_STOP_PERCENT`: Trailing stop distance (default: 1.5%)
-- `TAKE_PROFIT_PERCENT`: Take profit target (default: 3%)
-- `BREAKOUT_BUFFER`: Buffer to avoid noise (default: 0.001)
-- `USE_SCALPING`: Enable Bollinger Band scalping (default: true)
-- `ENABLE_TREND_FOLLOWING`: Enable slow grind detection (default: false)
-
-## Architecture
-
-### Core Components
-- **Hyperliquid Client**: TypeScript wrapper for Hyperliquid API (REST + WebSocket)
-- **Strategy Engine**: Breakout signal generation with volume confirmation and trend alignment
-- **Risk Manager**: Position sizing, stop-loss, daily limits, Kelly Criterion
-- **Data Service**: Binance historical data for indicator calculation
-- **Telegram Service**: Real-time notifications and bot control
-- **Execution Service**: Order placement and position management
-
-### Key Files
-- `src/core/exchange/HyperliquidClient.ts`: API client with EIP-712 signing
-- `src/core/strategy/BreakoutStrategy.ts`: Main strategy logic
-- `src/core/indicators/TechnicalIndicators.ts`: Technical indicators (RSI, MA, ATR, etc.)
-- `src/core/risk/RiskManager.ts`: Risk management rules
-- `src/services/data/BinanceDataService.ts`: Historical candle data
-- `src/services/telegram/TelegramService.ts`: Telegram bot integration
-- `src/index.ts`: Main bot orchestration
+---
 
 ## Trading Strategy
 
@@ -100,65 +65,117 @@ TELEGRAM_ENABLED=true
    - Detects cumulative moves over 2-5 candles (slow grinds >1.75%)
 
 2. **Trend Alignment**:
-   - **Breakouts/Large moves**: Require strict trend alignment (UPTREND for longs, DOWNTREND for shorts)
-   - **Cumulative moves**: Allow SIDEWAYS markets (captures slow grinds during consolidation)
    - Uses 20-MA vs 50-MA crossover for trend detection
-
-3. **Price Structure Confirmation**:
-   - LONG: Must show HIGHER_HIGHS structure
-   - SHORT: Must show LOWER_LOWS structure
+   - Price structure confirmation (HIGHER_HIGHS for longs, LOWER_LOWS for shorts)
    - Rejects CHOPPY markets to prevent whipsaw
 
-4. **Additional Filters**:
-   - RSI for logging (not used as filter)
-   - ATR for volatility confirmation
-   - Stop loss cooldown (15 min) after stop hit
+3. **Stop Loss Cooldown**: 15 minutes after stop hit to prevent revenge trading
 
 ### Exit Conditions
-1. **Trailing Stop**: 1.5% from peak (for longs)
-2. **Take Profit**: 3% profit target (optional)
-3. **Daily Loss Limit**: $100 daily loss limit
-4. **Manual Intervention**: Via Telegram /stop command
+- **Trailing Stop**: 5% from peak
+- **Take Profit**: Disabled (let trailing stop control exits)
+- **Daily Loss Limit**: $30
 
-### Risk Management
-- Max position size: $10 USD equivalent
-- Initial stop: 1.5% from entry
-- Trailing stop: 1.5% from peak
-- Daily loss limit: $100
-- Max concurrent positions: 3
-- Max leverage: 3x
-- Position sizing: Kelly Criterion inspired (1% risk per trade)
+---
 
-## Hyperliquid Specific Considerations
+## Configuration
 
-### Authentication
-- Uses EIP-712 typed data signing (ethers.js)
-- Requires wallet private key (not API key/secret)
-- All requests signed with wallet signature
-- ChainId: 1337 for Hyperliquid
+### Environment Variables (.env)
+```bash
+# Hyperliquid Authentication (wallet signing)
+HYPERLIQUID_PRIVATE_KEY=0x...
+HYPERLIQUID_ACCOUNT_ADDRESS=0x...
+HYPERLIQUID_ENV=MAINNET
 
-### API Endpoints
-- **Info**: `POST /info` - Market data, positions, balances
-- **Exchange**: `POST /exchange` - Trading operations (orders, cancels)
-- **WebSocket**: `wss://api.hyperliquid.xyz/ws` - Real-time updates
+# Trading
+TRADING_MODE=live
+TRADING_PAIRS=BTC,ETH,SOL,AVAX,HYPE,BNB,SUI,LINK,XRP
+POSITION_SIZE=75              # USD per position
+MAX_POSITIONS=6
+MAX_DAILY_LOSS=30
+MAX_LEVERAGE=3
 
-### Order Types
-- **Limit Orders**: Default order type
-- **Time-in-Force**: GTC (Good til canceled), IOC (Immediate or cancel), ALO (Add liquidity only)
-- **Reduce-Only**: For closing positions
+# Strategy
+LOOKBACK_PERIOD=20
+VOLUME_MULTIPLIER=1.5         # Require 1.5x volume
+TRAILING_STOP_PERCENT=5
+USE_SCALPING=true
+BREAKOUT_BUFFER=0.001
 
-### Symbol Format
-- Uses short symbols: "BTC", "ETH", "SOL" (not "BTC-USD.P" like Enclave)
-- Price increments vary by asset (BTC: $1, ETH: $0.10, etc.)
+# Telegram
+TELEGRAM_BOT_TOKEN=xxx
+TELEGRAM_CHAT_ID=xxx
+TELEGRAM_ENABLED=true
 
-### Margins
-- Cross margin by default
-- Can use isolated margin per position
-- Margin requirement based on leverage
+# Data Source
+BINANCE_BASE_URL=https://api.binance.com
+
+# Logging
+LOG_LEVEL=info
+```
+
+---
+
+## VPS Deployment
+
+### Server Details
+- **VPS**: Contabo (same as other bots)
+- **IP**: 109.199.105.63
+- **Path**: /opt/hyperliquid-bot
+- **Container**: hyperliquid-trading-bot
+
+### SSH Access
+```bash
+ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63
+```
+
+### Standard Deploy (after code changes)
+```bash
+# 1. Commit and push locally
+git add . && git commit -m "message" && git push origin main
+
+# 2. Sync VPS and rebuild (NEVER use --no-cache)
+ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63 "cd /opt/hyperliquid-bot && git fetch origin main && git reset --hard origin/main && docker compose down && docker compose build && docker compose up -d"
+```
+
+### Quick Restart (no code changes)
+```bash
+ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63 "cd /opt/hyperliquid-bot && docker compose restart"
+```
+
+### Check Status
+```bash
+# Container health
+ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63 "docker ps | grep hyperliquid"
+
+# Recent logs
+ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63 "docker logs --tail 50 hyperliquid-trading-bot"
+
+# Check for errors
+ssh -i ~/.ssh/id_ed25519_vps root@109.199.105.63 "docker logs hyperliquid-trading-bot 2>&1 | grep -i error | tail -10"
+```
+
+---
+
+## Development Commands
+
+### Local Development
+```bash
+pnpm install              # Install dependencies
+pnpm build               # Build TypeScript
+pnpm dev                 # Run with hot-reload
+```
+
+### Testing
+```bash
+pnpm test                # Run all tests
+pnpm test:unit           # Unit tests only
+pnpm typecheck           # TypeScript type checking
+```
+
+---
 
 ## Telegram Commands
-
-The bot supports real-time monitoring and control via Telegram:
 
 - `/start` - Welcome message and command list
 - `/status` - Current balance, positions, daily P&L
@@ -167,135 +184,133 @@ The bot supports real-time monitoring and control via Telegram:
 - `/alltime` - All-time statistics
 - `/stop` - Emergency stop (closes all positions)
 
-## Testing Strategy
+---
 
-### Paper Trading
-Before live trading:
-1. Set `TRADING_MODE=paper` and `HYPERLIQUID_ENV=TESTNET`
-2. Run on testnet for at least 1 week
-3. Monitor win rate (target > 40%)
-4. Check average win/loss ratio (target > 1.5)
-5. Verify stop-loss and take-profit execution
-6. Test Telegram commands
+## Docker Configuration
 
-### Risk Checks
-The bot automatically stops if:
-- Daily loss limit exceeded
-- Risk score > 80 (combines exposure, drawdown, positions)
-- Max drawdown reached (10%)
-
-## Deployment
-
-### Local Development
-```bash
-cp .env.example .env      # Create config
-# Edit .env with your credentials
-pnpm install              # Install deps
-pnpm dev                  # Run bot
+### Logging (prevents disk fill)
+```yaml
+logging:
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
 ```
 
-### Production VPS
-See `.deployment` file for VPS connection details (gitignored).
+### Health Check
+HTTP health check on port 3000 every 30 seconds.
 
-### Monitoring
-- Logs written to console (pino)
-- Telegram notifications for all trades
-- Daily/weekly summaries via Telegram
+### Data Persistence
+- `./logs` mounted to `/app/logs`
+
+---
+
+## Hyperliquid Exchange Specifics
+
+### Authentication
+- Uses EIP-712 typed data signing (ethers.js)
+- Requires wallet private key (NOT API key/secret)
+- ChainId: 1337 for Hyperliquid
+
+### API Endpoints
+- **Info**: `POST /info` - Market data, positions, balances
+- **Exchange**: `POST /exchange` - Trading operations
+- **WebSocket**: `wss://api.hyperliquid.xyz/ws`
+
+### Symbol Format
+- Short symbols: "BTC", "ETH", "SOL" (NOT "BTC-USD.P")
+- Price increments vary by asset
+
+### Historical Data
+- Hyperliquid doesn't provide historical candles
+- Uses Binance API for historical data
+- Real-time data from Hyperliquid WebSocket
+
+### Documentation
+- https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
+
+---
+
+## Common Tasks
+
+### Check why no trades are happening
+```bash
+docker logs hyperliquid-trading-bot 2>&1 | grep -i 'signal\|breakout\|rejected' | tail -20
+```
+
+### Adjust position sizing
+Edit `.env`:
+```bash
+POSITION_SIZE=75  # USD amount per position
+```
+
+### Check open positions
+```bash
+docker logs hyperliquid-trading-bot 2>&1 | grep -i 'position\|opened\|closed' | tail -20
+```
+
+---
 
 ## Troubleshooting
 
-### Common Issues
+### API Signing Errors
+**NEVER rebuild with --no-cache** - this pulls new npm dependencies that can break EIP-712 signing. If you get signing errors after a rebuild:
+1. Restore the old Docker image from backup
+2. Or rebuild without --no-cache
 
-1. **Authentication Errors**:
-   - Check private key format (must be 0x-prefixed)
-   - Verify account address matches wallet
-   - Ensure wallet has USDC balance
-
-2. **No Signals Generated**:
-   - Check if sufficient price history loaded
-   - Verify Binance data service is working
-   - Check trend alignment (may be rejecting counter-trend signals)
-
-3. **Orders Rejected**:
-   - Verify account balance and margin
-   - Check position limits not exceeded
-   - Ensure price increment is correct for symbol
-
-4. **Stop Loss Not Triggering**:
-   - Check trailing stop update loop is running
-   - Verify position exists and is tracked
-   - Check mark price vs stop price
-
-### Debug Mode
+### Container keeps restarting
 ```bash
-LOG_LEVEL=debug pnpm dev  # Verbose logging
+docker logs --tail 100 hyperliquid-trading-bot
 ```
 
-### Emergency Stop
-Use Telegram `/stop` command or:
-```bash
-# Kill the bot process
-pkill -f "node.*index.js"
-```
+### No signals generating
+- Check if Binance data service is loading historical candles
+- Verify trend alignment isn't rejecting all signals
+- Check volume multiplier isn't too high
 
-## Performance Tracking
+### Authentication errors
+- Verify private key format (must be 0x-prefixed)
+- Check account address matches wallet
+- Ensure wallet has USDC balance
 
-Track these metrics via Telegram:
-- **Win Rate**: Target > 40%
-- **Avg Win/Loss Ratio**: Target > 1.5
-- **Max Drawdown**: Keep < 10%
-- **Daily P&L**: Monitor for consistency
-- **Risk Score**: Keep < 60 (safe zone)
+---
 
-## Differences from Enclave Bot
+## Other Bots on Same VPS
 
-1. **Authentication**: Uses wallet signing (EIP-712) instead of API key/secret
-2. **Symbol Format**: Short symbols ("BTC") vs Enclave format ("BTC-USD.P")
-3. **Historical Data**: Uses Binance for historical candles (Hyperliquid doesn't provide)
-4. **Price Increments**: Different tick sizes per asset
-5. **WebSocket**: Different subscription format
-6. **Order Types**: Limit orders with TIF instead of separate market/limit
-7. **Margins**: Cross margin default vs isolated
+For reference:
+- **Binance Bot**: /opt/Binance_Bot (Python, most mature)
+- **Enclave Bot**: /opt/enclave-bot (TypeScript)
+- **Gold Bot**: /opt/Oanda_Gold
 
-## Next Steps
+All use similar patterns: Docker Compose, Telegram notifications.
 
-1. ✅ Complete TypeScript implementation
-2. ✅ Port breakout strategy from enclave-bot
-3. ✅ Add Telegram integration
-4. ⏳ Test on Hyperliquid testnet
-5. ⏳ Verify order execution and fills
-6. ⏳ Test trailing stops and take profit
-7. ⏳ Run paper trading for 1 week
-8. ⏳ Deploy to mainnet with small position sizes
-9. ⏳ Monitor performance and adjust parameters
-10. ⏳ Gradually scale up position sizes
+---
+
+## Key Differences from Other Bots
+
+| Aspect | Binance Bot | Enclave Bot | Hyperliquid Bot |
+|--------|-------------|-------------|-----------------|
+| Language | Python | TypeScript | TypeScript |
+| Exchange | Binance Spot | Enclave Perps | Hyperliquid Perps |
+| Auth | API Key | API Key | Wallet Signing |
+| Historical Data | Binance | Enclave WS | Binance (external) |
+| Symbol Format | BTCUSDT | BTC-USD.P | BTC |
+
+---
 
 ## Notes for Claude
 
 When working on this project:
-1. Always test on TESTNET first
-2. Verify private key and address are correct
-3. Check Binance data service is loading historical candles
-4. Monitor logs for strategy signal generation
-5. Test Telegram commands before relying on them
-6. Verify trailing stops are updating correctly
-7. Check that stop loss cooldowns are working (prevents whipsaw)
-8. Ensure trend alignment is rejecting counter-trend signals
-9. Monitor risk score and daily P&L limits
+1. **Use pnpm** - Not npm or yarn
+2. **NEVER use --no-cache** - Breaks EIP-712 signing
+3. **Wallet signing** - Uses ethers.js EIP-712, not API key/secret
+4. **Historical data from Binance** - Hyperliquid doesn't provide it
+5. **TypeScript strict mode** - Follow existing patterns
+6. **Test in paper mode first** - Set `TRADING_MODE=paper`
+7. **Check Binance data service** - If no candles, no signals
 
-## Security Considerations
+## Security Reminders
 
-- **Private Key**: NEVER commit .env file or expose private key
-- **Wallet Security**: Use a dedicated trading wallet, not your main wallet
-- **API Access**: Consider using Hyperliquid API wallets for extra security
-- **Rate Limits**: Respect Hyperliquid API rate limits
-- **Position Limits**: Start small, scale gradually based on performance
-- **Testnet First**: ALWAYS test on testnet before mainnet
-
-## Useful Links
-
-- Hyperliquid Docs: https://hyperliquid.gitbook.io/hyperliquid-docs
-- Hyperliquid API: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
-- Python SDK (reference): https://github.com/hyperliquid-dex/hyperliquid-python-sdk
-- Ethers.js (signing): https://docs.ethers.org/v6/
-- EIP-712: https://eips.ethereum.org/EIPS/eip-712
+- **Private Key**: NEVER commit .env or expose private key
+- **Dedicated Wallet**: Use a trading wallet, not your main wallet
+- **Start Small**: Scale up based on performance
