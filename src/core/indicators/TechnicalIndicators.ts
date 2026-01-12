@@ -175,6 +175,15 @@ export class TechnicalIndicators {
     return null;
   }
 
+  /**
+   * 3-Layer Trend Detection (matching Binance_Bot's stricter filtering)
+   *
+   * Layer 1: ATR-based range detection (catches tight ranges)
+   * Layer 2: Price structure analysis (higher highs/lower lows)
+   * Layer 3: EMA alignment confirmation
+   *
+   * ALL THREE layers must confirm for bullish/bearish, otherwise sideways
+   */
   public static detectTrend(
     prices: PriceData[],
     shortPeriod = 20,
@@ -184,19 +193,102 @@ export class TechnicalIndicators {
       return 'SIDEWAYS';
     }
 
+    const recent = prices.slice(-20);
+    const currentPrice = recent[recent.length - 1].close;
+
+    // === LAYER 1: ATR-based Range Detection ===
+    // If price is oscillating in a tight range relative to volatility = RANGING
+    const atr = this.calculateATR(prices, 14);
+    const recent10 = prices.slice(-10);
+    const recentHigh = recent10.reduce((max, p) => p.high.greaterThan(max) ? p.high : max, recent10[0].high);
+    const recentLow = recent10.reduce((min, p) => p.low.lessThan(min) ? p.low : min, recent10[0].low);
+    const priceRangePct = recentHigh.minus(recentLow).dividedBy(currentPrice);
+    const atrPct = atr.dividedBy(currentPrice);
+
+    // If price range < 2x ATR, it's ranging/choppy
+    if (priceRangePct.lessThan(atrPct.times(2))) {
+      return 'SIDEWAYS';
+    }
+
+    // === LAYER 2: Price Structure Analysis ===
+    // Check if making higher highs AND higher lows (uptrend structure)
+    // or lower highs AND lower lows (downtrend structure)
+    const firstHalf = prices.slice(-20, -10);
+    const secondHalf = prices.slice(-10);
+
+    const firstHalfHigh = firstHalf.reduce((max, p) => p.high.greaterThan(max) ? p.high : max, firstHalf[0].high);
+    const secondHalfHigh = secondHalf.reduce((max, p) => p.high.greaterThan(max) ? p.high : max, secondHalf[0].high);
+    const firstHalfLow = firstHalf.reduce((min, p) => p.low.lessThan(min) ? p.low : min, firstHalf[0].low);
+    const secondHalfLow = secondHalf.reduce((min, p) => p.low.lessThan(min) ? p.low : min, secondHalf[0].low);
+
+    const higherHighs = secondHalfHigh.greaterThan(firstHalfHigh);
+    const higherLows = secondHalfLow.greaterThan(firstHalfLow);
+    const lowerHighs = secondHalfHigh.lessThan(firstHalfHigh);
+    const lowerLows = secondHalfLow.lessThan(firstHalfLow);
+
+    const structureBullish = higherHighs && higherLows;
+    const structureBearish = lowerHighs && lowerLows;
+
+    // Mixed/choppy structure - reject
+    if (!structureBullish && !structureBearish) {
+      return 'SIDEWAYS';
+    }
+
+    // === LAYER 3: EMA Alignment Confirmation ===
     const closePrices = prices.map(p => p.close);
-    const ma20 = this.calculateSMA(closePrices.slice(-shortPeriod), shortPeriod);
-    const ma50 = this.calculateSMA(closePrices.slice(-longPeriod), longPeriod);
+    const emaFast = this.calculateEMA(closePrices, 9);
+    const emaSlow = this.calculateEMA(closePrices, 21);
+    const emaTrend = this.calculateEMA(closePrices, 50);
 
-    const threshold = ma50.times(0.002);
+    const emaBullish = emaFast.greaterThan(emaSlow) && emaSlow.greaterThan(emaTrend);
+    const emaBearish = emaFast.lessThan(emaSlow) && emaSlow.lessThan(emaTrend);
 
-    if (ma20.greaterThan(ma50.plus(threshold))) {
+    // Only return bullish/bearish if ALL layers confirm
+    if (structureBullish && emaBullish) {
       return 'UPTREND';
-    } else if (ma20.lessThan(ma50.minus(threshold))) {
+    } else if (structureBearish && emaBearish) {
       return 'DOWNTREND';
     } else {
       return 'SIDEWAYS';
     }
+  }
+
+  /**
+   * Detect EMA Stack trend (EMA20 > EMA50 > EMA200 for BULLISH)
+   * This is the strong trend confirmation used by Enclave - requires ALL 3 EMAs aligned
+   * BULLISH: EMA20 > EMA50 > EMA200 (full bullish stack)
+   * BEARISH: EMA20 < EMA50 < EMA200 (full bearish stack)
+   * SIDEWAYS: Mixed alignment = NO TRADE (choppy market)
+   */
+  public static detectEMAStack(
+    prices: PriceData[]
+  ): { trend: 'BULLISH' | 'BEARISH' | 'SIDEWAYS'; ema20: Decimal; ema50: Decimal; ema200: Decimal } {
+    if (prices.length < 200) {
+      return {
+        trend: 'SIDEWAYS',
+        ema20: new Decimal(0),
+        ema50: new Decimal(0),
+        ema200: new Decimal(0)
+      }; // Not enough data for full EMA stack
+    }
+
+    const closePrices = prices.map(p => p.close);
+    const ema20 = this.calculateEMA(closePrices, 20);
+    const ema50 = this.calculateEMA(closePrices, 50);
+    const ema200 = this.calculateEMA(closePrices, 200);
+
+    // BULLISH: EMA20 > EMA50 > EMA200 (all stacked bullishly)
+    if (ema20.greaterThan(ema50) && ema50.greaterThan(ema200)) {
+      return { trend: 'BULLISH', ema20, ema50, ema200 };
+    }
+
+    // BEARISH: EMA20 < EMA50 < EMA200 (all stacked bearishly)
+    if (ema20.lessThan(ema50) && ema50.lessThan(ema200)) {
+      return { trend: 'BEARISH', ema20, ema50, ema200 };
+    }
+
+    // Mixed alignment = SIDEWAYS (choppy, ranging)
+    return { trend: 'SIDEWAYS', ema20, ema50, ema200 };
   }
 
   public static detectPriceStructure(
@@ -414,5 +506,171 @@ export class TechnicalIndicators {
       }
       return { aligned: false, reason: `EMA21 ${ema21.toFixed(2)} above EMA50 ${ema50.toFixed(2)}` };
     }
+  }
+
+  /**
+   * Calculate VWAP (Volume Weighted Average Price)
+   * Uses the available price data to calculate typical price weighted by volume
+   */
+  public static calculateVWAP(prices: PriceData[]): Decimal {
+    if (prices.length === 0) {
+      throw new Error('No data for VWAP calculation');
+    }
+
+    let cumulativeTPV = new Decimal(0); // Cumulative (Typical Price * Volume)
+    let cumulativeVolume = new Decimal(0);
+
+    for (const candle of prices) {
+      // Typical price = (High + Low + Close) / 3
+      const typicalPrice = candle.high.plus(candle.low).plus(candle.close).dividedBy(3);
+      cumulativeTPV = cumulativeTPV.plus(typicalPrice.times(candle.volume));
+      cumulativeVolume = cumulativeVolume.plus(candle.volume);
+    }
+
+    if (cumulativeVolume.isZero()) {
+      return prices[prices.length - 1].close; // Return last close if no volume
+    }
+
+    return cumulativeTPV.dividedBy(cumulativeVolume);
+  }
+
+  /**
+   * Calculate momentum score - weighted combination of multiple factors
+   * Matching Binance_Bot's momentum scoring system
+   *
+   * Weights:
+   * - Trend strength: 35%
+   * - RSI momentum: 25%
+   * - MACD momentum: 20%
+   * - Volume momentum: 10%
+   * - VWAP strength: 10%
+   *
+   * Returns score from 0 to 1, where >= 0.70 is considered high conviction
+   */
+  public static calculateMomentumScore(
+    prices: PriceData[],
+    currentVolume: Decimal,
+    averageVolume: Decimal,
+    direction: 'BULLISH' | 'BEARISH'
+  ): {
+    score: Decimal;
+    components: {
+      trendStrength: Decimal;
+      rsiMomentum: Decimal;
+      macdMomentum: Decimal;
+      volumeMomentum: Decimal;
+      vwapStrength: Decimal;
+    };
+    details: string;
+  } {
+    const currentPrice = prices[prices.length - 1].close;
+
+    // 1. Trend Strength (35%)
+    // Based on EMA alignment and trend detection
+    let trendStrength = new Decimal(0);
+    const trend = this.detectTrend(prices);
+    const emaCheck = this.isEmaAligned(prices, direction);
+
+    if (direction === 'BULLISH') {
+      if (trend === 'UPTREND') trendStrength = trendStrength.plus(0.5);
+      if (emaCheck.aligned) trendStrength = trendStrength.plus(0.5);
+    } else {
+      if (trend === 'DOWNTREND') trendStrength = trendStrength.plus(0.5);
+      if (emaCheck.aligned) trendStrength = trendStrength.plus(0.5);
+    }
+
+    // 2. RSI Momentum (25%)
+    // For BULLISH: RSI 40-60 = neutral, 60-70 = good momentum, <40 = weak
+    // For BEARISH: RSI 40-60 = neutral, 30-40 = good momentum, >60 = weak
+    let rsiMomentum = new Decimal(0);
+    try {
+      const rsi = this.calculateRSI(prices);
+      const rsiNum = rsi.toNumber();
+
+      if (direction === 'BULLISH') {
+        if (rsiNum >= 50 && rsiNum <= 70) {
+          rsiMomentum = new Decimal(Math.min((rsiNum - 40) / 30, 1)); // Scale 40-70 to 0-1
+        } else if (rsiNum > 70) {
+          rsiMomentum = new Decimal(0.3); // Overbought, weak momentum
+        } else if (rsiNum >= 30) {
+          rsiMomentum = new Decimal(0.5); // Neutral
+        }
+      } else {
+        if (rsiNum <= 50 && rsiNum >= 30) {
+          rsiMomentum = new Decimal(Math.min((60 - rsiNum) / 30, 1)); // Scale 30-60 to 1-0
+        } else if (rsiNum < 30) {
+          rsiMomentum = new Decimal(0.3); // Oversold, weak momentum
+        } else if (rsiNum <= 70) {
+          rsiMomentum = new Decimal(0.5); // Neutral
+        }
+      }
+    } catch {
+      rsiMomentum = new Decimal(0.5); // Default neutral if calculation fails
+    }
+
+    // 3. MACD Momentum (20%)
+    let macdMomentum = new Decimal(0);
+    try {
+      const macdCheck = this.isMacdAligned(prices, direction);
+      if (macdCheck.aligned) {
+        // Scale based on histogram strength
+        const histAbs = macdCheck.histogram.abs();
+        const signalAbs = macdCheck.signal.abs();
+        if (!signalAbs.isZero()) {
+          const histRatio = histAbs.dividedBy(signalAbs);
+          macdMomentum = Decimal.min(histRatio, new Decimal(1)); // Cap at 1
+        } else {
+          macdMomentum = new Decimal(0.7); // MACD aligned but weak signal
+        }
+      } else {
+        macdMomentum = new Decimal(0.2); // Not aligned
+      }
+    } catch {
+      macdMomentum = new Decimal(0.5);
+    }
+
+    // 4. Volume Momentum (10%)
+    // Normalize volume ratio (1.5x = 0.75, 2x = 1.0)
+    let volumeMomentum = new Decimal(0);
+    if (!averageVolume.isZero()) {
+      const volRatio = currentVolume.dividedBy(averageVolume);
+      volumeMomentum = Decimal.min(volRatio.dividedBy(2), new Decimal(1)); // 2x volume = 1.0
+    }
+
+    // 5. VWAP Strength (10%)
+    // For BULLISH: price > VWAP = 1.0, else 0.3
+    // For BEARISH: price < VWAP = 1.0, else 0.3
+    let vwapStrength = new Decimal(0.3);
+    try {
+      const vwap = this.calculateVWAP(prices.slice(-20)); // Use last 20 candles for VWAP
+      if (direction === 'BULLISH' && currentPrice.greaterThan(vwap)) {
+        vwapStrength = new Decimal(1);
+      } else if (direction === 'BEARISH' && currentPrice.lessThan(vwap)) {
+        vwapStrength = new Decimal(1);
+      }
+    } catch {
+      vwapStrength = new Decimal(0.5);
+    }
+
+    // Calculate weighted score
+    const score = trendStrength.times(0.35)
+      .plus(rsiMomentum.times(0.25))
+      .plus(macdMomentum.times(0.20))
+      .plus(volumeMomentum.times(0.10))
+      .plus(vwapStrength.times(0.10));
+
+    const details = `trend=${trendStrength.toFixed(2)}, rsi=${rsiMomentum.toFixed(2)}, macd=${macdMomentum.toFixed(2)}, vol=${volumeMomentum.toFixed(2)}, vwap=${vwapStrength.toFixed(2)}`;
+
+    return {
+      score,
+      components: {
+        trendStrength,
+        rsiMomentum,
+        macdMomentum,
+        volumeMomentum,
+        vwapStrength,
+      },
+      details,
+    };
   }
 }
