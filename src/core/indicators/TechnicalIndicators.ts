@@ -79,25 +79,52 @@ export class TechnicalIndicators {
     return sum.dividedBy(periods);
   }
 
+  /**
+   * Calculate RSI using Wilder's Smoothing Method (industry standard)
+   * This matches pandas-ta and other professional trading libraries
+   *
+   * Wilder's smoothing: avg = (prev_avg * (N-1) + current) / N
+   * This is equivalent to EMA with alpha = 1/N
+   */
   public static calculateRSI(prices: PriceData[], periods = 14): Decimal {
     if (prices.length < periods + 1) {
       throw new Error(`Insufficient data for RSI calculation`);
     }
 
-    const changes: Decimal[] = [];
+    // Calculate all price changes
+    const gains: Decimal[] = [];
+    const losses: Decimal[] = [];
+
     for (let i = 1; i < prices.length; i++) {
-      changes.push(prices[i].close.minus(prices[i - 1].close));
+      const change = prices[i].close.minus(prices[i - 1].close);
+      if (change.greaterThan(0)) {
+        gains.push(change);
+        losses.push(new Decimal(0));
+      } else {
+        gains.push(new Decimal(0));
+        losses.push(change.abs());
+      }
     }
 
-    const recentChanges = changes.slice(-periods);
-    const gains = recentChanges.filter((c) => c.greaterThan(0));
-    const losses = recentChanges.filter((c) => c.lessThan(0)).map((c) => c.abs());
+    // First average: SMA of first N periods
+    let avgGain = new Decimal(0);
+    let avgLoss = new Decimal(0);
 
-    const totalGain = gains.reduce((sum, g) => sum.plus(g), new Decimal(0));
-    const totalLoss = losses.reduce((sum, l) => sum.plus(l), new Decimal(0));
+    for (let i = 0; i < periods; i++) {
+      avgGain = avgGain.plus(gains[i]);
+      avgLoss = avgLoss.plus(losses[i]);
+    }
+    avgGain = avgGain.dividedBy(periods);
+    avgLoss = avgLoss.dividedBy(periods);
 
-    const avgGain = totalGain.dividedBy(periods);
-    const avgLoss = totalLoss.dividedBy(periods);
+    // Apply Wilder's smoothing for remaining periods
+    // Formula: smoothed = (prev * (N-1) + current) / N
+    const smoothingFactor = new Decimal(periods - 1);
+
+    for (let i = periods; i < gains.length; i++) {
+      avgGain = avgGain.times(smoothingFactor).plus(gains[i]).dividedBy(periods);
+      avgLoss = avgLoss.times(smoothingFactor).plus(losses[i]).dividedBy(periods);
+    }
 
     if (avgLoss.isZero()) {
       return new Decimal(100);
