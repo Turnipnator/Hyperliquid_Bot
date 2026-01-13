@@ -262,10 +262,11 @@ export class TechnicalIndicators {
     }
 
     // === LAYER 3: EMA Alignment Confirmation ===
+    // Must use same periods as Binance_Bot: EMA20/50/200
     const closePrices = prices.map(p => p.close);
-    const emaFast = this.calculateEMA(closePrices, 9);
-    const emaSlow = this.calculateEMA(closePrices, 21);
-    const emaTrend = this.calculateEMA(closePrices, 50);
+    const emaFast = this.calculateEMA(closePrices, 20);
+    const emaSlow = this.calculateEMA(closePrices, 50);
+    const emaTrend = this.calculateEMA(closePrices, 200);
 
     const emaBullish = emaFast.greaterThan(emaSlow) && emaSlow.greaterThan(emaTrend);
     const emaBearish = emaFast.lessThan(emaSlow) && emaSlow.lessThan(emaTrend);
