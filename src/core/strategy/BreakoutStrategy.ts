@@ -42,15 +42,34 @@ export class BreakoutStrategy {
   private stopLossCooldowns: Map<string, number> = new Map();
   private scanCounts: Map<string, number> = new Map();
   private recentlyClosedPositions: Map<string, number> = new Map(); // Prevents duplicate close attempts
+  private pendingCloseOrders: Set<string> = new Set(); // Tracks positions with pending close orders
   private readonly STOP_LOSS_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
   private readonly CLOSE_POSITION_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes to avoid duplicate closes
 
   /**
-   * Get trailing stop percentage - flat 5% for all pairs
-   * Matches Binance/Enclave bot configuration for consistency
+   * Get trailing stop percentage for a symbol
+   * Checks for per-symbol overrides (meme coins), falls back to default 5%
    */
-  private getTrailingStopPercent(_symbol: string): number {
-    return 5;
+  private getTrailingStopPercent(symbol: string): number {
+    const override = config.symbolOverrides.get(symbol.toUpperCase());
+    if (override) {
+      this.logger.debug(`${symbol}: Using custom SL ${override.trailingStopPercent}% (meme coin override)`);
+      return override.trailingStopPercent;
+    }
+    return 5; // Default 5% for normal pairs
+  }
+
+  /**
+   * Get take profit percentage for a symbol
+   * Checks for per-symbol overrides (meme coins), falls back to config default
+   */
+  private getTakeProfitPercent(symbol: string): number {
+    const override = config.symbolOverrides.get(symbol.toUpperCase());
+    if (override) {
+      this.logger.debug(`${symbol}: Using custom TP ${override.takeProfitPercent}% (meme coin override)`);
+      return override.takeProfitPercent;
+    }
+    return this.config.takeProfitPercent || 1.3; // Default 1.3%
   }
 
   constructor(client: HyperliquidClient, strategyConfig: BreakoutConfig, telegram?: TelegramService) {
@@ -75,6 +94,8 @@ export class BreakoutStrategy {
       increment = 0.001; // 3 decimal places
     } else if (symbol === 'XRP' || symbol === 'SUI') {
       increment = 0.0001; // 4 decimal places
+    } else if (symbol === 'SHIB' || symbol === 'BONK') {
+      increment = 0.00000001; // 8 decimal places for meme coins
     } else {
       increment = 0.001; // Default to 3 decimal places
     }
@@ -109,8 +130,8 @@ export class BreakoutStrategy {
         }
       }
 
-      // Keep only necessary history (50 candles = ~4 hours of 5m data)
-      const maxHistory = Math.max(50, this.config.lookbackPeriod * 2);
+      // Keep 250 candles for EMA200 calculation (~21 hours of 5m data)
+      const maxHistory = Math.max(250, this.config.lookbackPeriod * 2);
       if (history.length > maxHistory) {
         history.splice(0, history.length - maxHistory);
       }
@@ -315,6 +336,64 @@ export class BreakoutStrategy {
       if (breakout && volumeSpike && breakoutCandle) {
         this.logger.info(`${symbol}: ${breakout} breakout detected in ${trend} market`);
 
+        // LONG ONLY MODE - Skip all short signals
+        if (config.longOnly && breakout === 'BEARISH') {
+          this.logger.info(`${symbol}: BEARISH breakout SKIPPED - LONG_ONLY mode enabled`);
+          return null;
+        }
+
+        // =========================================================================
+        // SUSTAINED VOLUME CHECK - Matching Binance_Bot's vol_min3 filter
+        // Requires MINIMUM of last 3 candles to have >= 1.5x volume
+        // This prevents entries on single volume spikes that quickly fade
+        // =========================================================================
+        const volMin3 = TechnicalIndicators.calculateMinVolumeRatio(history, avgVolume, 3);
+        if (volMin3.lessThan(this.config.volumeMultiplier)) {
+          this.logger.info(
+            `${symbol}: ${breakout} breakout REJECTED - sustained volume too low. ` +
+            `vol_min3=${volMin3.toFixed(2)}x (need >= ${this.config.volumeMultiplier}x for last 3 candles)`
+          );
+          return null;
+        }
+        this.logger.info(`${symbol}: Sustained volume confirmed ✓ - vol_min3=${volMin3.toFixed(2)}x`);
+
+        // =========================================================================
+        // EMA STACK HARD GATE - Matching Enclave's strict filtering
+        // Requires ALL 3 EMAs aligned: EMA20 > EMA50 > EMA200 (or reverse for bearish)
+        // This is the PRIMARY trend filter - if EMAs aren't stacked, NO TRADE
+        // =========================================================================
+        const emaStack = TechnicalIndicators.detectEMAStack(history);
+
+        if (emaStack.trend === 'SIDEWAYS') {
+          this.logger.info(
+            `${symbol}: ${breakout} breakout REJECTED - EMA stack is SIDEWAYS (choppy market). ` +
+            `EMA20=${emaStack.ema20.toFixed(2)}, EMA50=${emaStack.ema50.toFixed(2)}, EMA200=${emaStack.ema200.toFixed(2)}`
+          );
+          return null;
+        }
+
+        // EMA stack must match signal direction
+        if (breakout === 'BULLISH' && emaStack.trend !== 'BULLISH') {
+          this.logger.info(
+            `${symbol}: BULLISH breakout REJECTED - EMA stack is ${emaStack.trend}, need BULLISH. ` +
+            `EMA20=${emaStack.ema20.toFixed(2)}, EMA50=${emaStack.ema50.toFixed(2)}, EMA200=${emaStack.ema200.toFixed(2)}`
+          );
+          return null;
+        }
+
+        if (breakout === 'BEARISH' && emaStack.trend !== 'BEARISH') {
+          this.logger.info(
+            `${symbol}: BEARISH breakout REJECTED - EMA stack is ${emaStack.trend}, need BEARISH. ` +
+            `EMA20=${emaStack.ema20.toFixed(2)}, EMA50=${emaStack.ema50.toFixed(2)}, EMA200=${emaStack.ema200.toFixed(2)}`
+          );
+          return null;
+        }
+
+        this.logger.info(
+          `${symbol}: EMA stack ${emaStack.trend} confirmed ✓ - ` +
+          `EMA20=${emaStack.ema20.toFixed(2)} > EMA50=${emaStack.ema50.toFixed(2)} > EMA200=${emaStack.ema200.toFixed(2)}`
+        );
+
         // STRICT TREND FILTER - Matching Binance_Bot approach
         // Require trend alignment for all signals (prevents counter-trend entries)
         if (breakout === 'BULLISH' && trend !== 'UPTREND') {
@@ -381,6 +460,26 @@ export class BreakoutStrategy {
           return null;
         }
 
+        // MOMENTUM SCORE FILTER - Final quality gate matching Binance_Bot
+        // Combines trend, RSI, MACD, volume, and VWAP into weighted score
+        const currentVolume = history[history.length - 1].volume;
+        const momentumResult = TechnicalIndicators.calculateMomentumScore(
+          history,
+          currentVolume,
+          avgVolume,
+          breakout
+        );
+
+        if (momentumResult.score.lessThan(config.minMomentumScore)) {
+          this.logger.info(
+            `${symbol}: ${breakout} signal REJECTED - momentum score ${momentumResult.score.toFixed(2)} < ${config.minMomentumScore} (${momentumResult.details})`
+          );
+          return null;
+        }
+        this.logger.info(
+          `${symbol}: Momentum score ${momentumResult.score.toFixed(2)} >= ${config.minMomentumScore} ✓ (${momentumResult.details})`
+        );
+
         const side = breakout === 'BULLISH' ? OrderSide.BUY : OrderSide.SELL;
         const entryPrice = currentPrice;
         const trailingStopPct = this.getTrailingStopPercent(symbol);
@@ -398,12 +497,11 @@ export class BreakoutStrategy {
           confidence += 0.1;
         }
 
-        let takeProfit: Decimal | undefined;
-        if (this.config.takeProfitPercent) {
-          takeProfit = breakout === 'BULLISH'
-            ? entryPrice.times(1 + this.config.takeProfitPercent / 100)
-            : entryPrice.times(1 - this.config.takeProfitPercent / 100);
-        }
+        // Get take profit percent (may have per-symbol override for meme coins)
+        const tpPercent = this.getTakeProfitPercent(symbol);
+        const takeProfit = breakout === 'BULLISH'
+          ? entryPrice.times(1 + tpPercent / 100)
+          : entryPrice.times(1 - tpPercent / 100);
 
         if (breakout === 'BULLISH' && priceStructure === 'HIGHER_HIGHS') {
           confidence += 0.1;
@@ -558,10 +656,8 @@ export class BreakoutStrategy {
 
               const rsi = TechnicalIndicators.calculateRSI(history);
 
-              let takeProfit: Decimal | undefined;
-              if (this.config.takeProfitPercent) {
-                takeProfit = entryPrice.times(1 - this.config.takeProfitPercent / 100);
-              }
+              const tpPercent = this.getTakeProfitPercent(symbol);
+              const takeProfit = entryPrice.times(1 - tpPercent / 100);
 
               const signal: Signal = {
                 symbol,
@@ -592,10 +688,8 @@ export class BreakoutStrategy {
 
               const rsi = TechnicalIndicators.calculateRSI(history);
 
-              let takeProfit: Decimal | undefined;
-              if (this.config.takeProfitPercent) {
-                takeProfit = entryPrice.times(1 + this.config.takeProfitPercent / 100);
-              }
+              const tpPercent = this.getTakeProfitPercent(symbol);
+              const takeProfit = entryPrice.times(1 + tpPercent / 100);
 
               const signal: Signal = {
                 symbol,
@@ -676,35 +770,80 @@ export class BreakoutStrategy {
 
       this.logger.info({ orderResponse }, `Order placed for ${signal.symbol}`);
 
-      // Register active signal
-      this.activeSignals.set(signal.symbol, signal);
+      // Check if order was filled or is resting
+      const orderStatus = orderResponse?.response?.data?.statuses?.[0];
+      const isFilled = orderStatus?.filled !== undefined;
+      const isResting = orderStatus?.resting !== undefined;
 
-      // Initialize trailing stop
-      if (signal.side === OrderSide.BUY) {
-        // For longs: track the high, stop is below
-        this.trailingStops.set(signal.symbol, {
-          high: signal.entryPrice,
-          stop: signal.stopLoss,
-        });
-        this.logger.info(`Initialized trailing stop for ${signal.symbol} LONG: stop at ${signal.stopLoss.toFixed(2)} (tracking high from ${signal.entryPrice.toFixed(2)})`);
-      } else {
-        // For shorts: track the low (stored in 'high' field), stop is above
-        this.trailingStops.set(signal.symbol, {
-          high: signal.entryPrice, // This is the LOW for shorts
-          stop: signal.stopLoss,   // Stop is above entry for shorts
-        });
-        this.logger.info(`Initialized trailing stop for ${signal.symbol} SHORT: stop at ${signal.stopLoss.toFixed(2)} (tracking low from ${signal.entryPrice.toFixed(2)})`);
+      if (isResting && orderStatus?.resting) {
+        // Order is on the book but not filled - cancel it since price moved
+        const oid = orderStatus.resting.oid;
+        this.logger.warn(`⚠️ Order for ${signal.symbol} is RESTING (oid: ${oid}) - not filled at ${signal.entryPrice}. Cancelling...`);
+
+        try {
+          await this.client.cancelOrder(signal.symbol, oid);
+          this.logger.info(`Cancelled unfilled order for ${signal.symbol}`);
+        } catch (cancelError) {
+          this.logger.error({ cancelError }, `Failed to cancel resting order for ${signal.symbol}`);
+        }
+
+        // Don't register as active signal since order didn't fill
+        return;
       }
 
-      // Notify via Telegram
+      if (!isFilled || !orderStatus?.filled) {
+        this.logger.error({ orderStatus }, `Unexpected order status for ${signal.symbol}`);
+        return;
+      }
+
+      // Order filled - get the actual fill price and size
+      const fillInfo = orderStatus.filled;
+      const avgFillPrice = new Decimal(fillInfo.avgPx as string);
+      const filledQty = new Decimal(fillInfo.totalSz as string);
+      this.logger.info(`Order FILLED for ${signal.symbol}: ${filledQty} @ ${avgFillPrice}`);
+
+      // Register active signal with actual fill price
+      const filledSignal = {
+        ...signal,
+        entryPrice: avgFillPrice,
+      };
+      this.activeSignals.set(signal.symbol, filledSignal);
+
+      // Initialize trailing stop with actual fill price
+      const trailingStopPct = this.getTrailingStopPercent(signal.symbol);
+      if (signal.side === OrderSide.BUY) {
+        // For longs: track the high, stop is below
+        const newStop = avgFillPrice.times(1 - trailingStopPct / 100);
+        this.trailingStops.set(signal.symbol, {
+          high: avgFillPrice,
+          stop: newStop,
+        });
+        this.logger.info(`Initialized trailing stop for ${signal.symbol} LONG: stop at ${newStop.toFixed(2)} (tracking high from ${avgFillPrice.toFixed(2)})`);
+      } else {
+        // For shorts: track the low (stored in 'high' field), stop is above
+        const newStop = avgFillPrice.times(1 + trailingStopPct / 100);
+        this.trailingStops.set(signal.symbol, {
+          high: avgFillPrice, // This is the LOW for shorts
+          stop: newStop,      // Stop is above entry for shorts
+        });
+        this.logger.info(`Initialized trailing stop for ${signal.symbol} SHORT: stop at ${newStop.toFixed(2)} (tracking low from ${avgFillPrice.toFixed(2)})`);
+      }
+
+      // Recalculate take profit based on actual fill price
+      const takeProfitPct = this.config.takeProfitPercent || 1.3;
+      const actualTakeProfit = signal.side === OrderSide.BUY
+        ? avgFillPrice.times(1 + takeProfitPct / 100)
+        : avgFillPrice.times(1 - takeProfitPct / 100);
+
+      // Notify via Telegram - only when order is FILLED
       if (this.telegram) {
         await this.telegram.notifyPositionOpened(
           signal.symbol,
           signal.side,
-          quantity.toString(),
-          signal.entryPrice,
-          signal.stopLoss,
-          signal.takeProfit,
+          filledQty.toString(),
+          avgFillPrice,
+          this.trailingStops.get(signal.symbol)!.stop,
+          actualTakeProfit,
           signal.reason
         );
       }
@@ -721,6 +860,19 @@ export class BreakoutStrategy {
   public async updateTrailingStops(): Promise<void> {
     try {
       const positions = await this.client.getPositions();
+      const currentSymbols = new Set(positions.map(p => p.symbol));
+
+      // Check if any pending close orders have been filled (position no longer exists)
+      for (const symbol of this.pendingCloseOrders) {
+        if (!currentSymbols.has(symbol)) {
+          // Position is gone - close order filled successfully
+          this.logger.info(`Position ${symbol} confirmed closed - clearing pending order and cleanup`);
+          this.pendingCloseOrders.delete(symbol);
+          this.activeSignals.delete(symbol);
+          this.trailingStops.delete(symbol);
+          this.recentlyClosedPositions.delete(symbol);
+        }
+      }
 
       for (const position of positions) {
         // Skip positions that were recently closed (prevents duplicate close attempts)
@@ -734,6 +886,12 @@ export class BreakoutStrategy {
             // Cooldown expired, remove from recently closed
             this.recentlyClosedPositions.delete(position.symbol);
           }
+        }
+
+        // Skip positions with pending close orders to prevent loop
+        if (this.pendingCloseOrders.has(position.symbol)) {
+          this.logger.debug(`Skipping ${position.symbol} - has pending close order`);
+          continue;
         }
 
         let trailingStop = this.trailingStops.get(position.symbol);
@@ -869,6 +1027,10 @@ export class BreakoutStrategy {
         true // reduce-only
       );
 
+      // Mark as having a pending close order to prevent re-processing
+      this.pendingCloseOrders.add(symbol);
+      this.logger.info(`Added ${symbol} to pending close orders`);
+
       // Mark position as recently closed to prevent duplicate close attempts
       this.recentlyClosedPositions.set(symbol, Date.now());
 
@@ -883,9 +1045,8 @@ export class BreakoutStrategy {
         );
       }
 
-      // Cleanup
-      this.activeSignals.delete(symbol);
-      this.trailingStops.delete(symbol);
+      // DON'T cleanup activeSignals/trailingStops here - order might not fill
+      // Cleanup will happen when position is confirmed closed
 
       // Set cooldown if stop loss
       if (reason.includes('stop')) {

@@ -48,6 +48,27 @@ export class TechnicalIndicators {
     return totalVolume.dividedBy(periods);
   }
 
+  /**
+   * Calculate the MINIMUM volume ratio over the last N candles
+   * This is the "sustained volume" filter from Binance_Bot
+   * Requires volume to be consistently high, not just a single spike
+   */
+  public static calculateMinVolumeRatio(
+    prices: PriceData[],
+    avgVolume: Decimal,
+    lookbackCandles = 3
+  ): Decimal {
+    if (prices.length < lookbackCandles) {
+      return new Decimal(0);
+    }
+
+    const recentCandles = prices.slice(-lookbackCandles);
+    const volumeRatios = recentCandles.map(p => p.volume.dividedBy(avgVolume));
+
+    // Return the MINIMUM volume ratio (weakest candle)
+    return Decimal.min(...volumeRatios);
+  }
+
   public static isVolumeSpike(
     currentVolume: Decimal,
     averageVolume: Decimal,
