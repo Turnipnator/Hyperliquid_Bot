@@ -1,3 +1,7 @@
+> **Common Patterns**: See `~/trading-bot-skill.md` for deployment, Docker, Telegram, and strategy patterns shared across all trading bots.
+
+---
+
 # Hyperliquid Trading Bot - Claude Code Instructions
 
 ## CRITICAL RULES

@@ -326,19 +326,46 @@ export class HyperliquidClient {
     return await this.exchangeRequest(cancelAction);
   }
 
-  // Cancel all orders for a coin
-  async cancelAllOrders(coin?: string): Promise<any> {
-    const cancelAction: any = {
-      type: 'cancelByCloid',
-      cancels: [],
-    };
-
-    if (coin) {
-      const asset = this.getCoinIndex(coin);
-      cancelAction.cancels.push({ asset, cloid: '*' });
+  // Get open orders
+  async getOpenOrders(): Promise<Array<{ coin: string; side: string; limitPx: string; sz: string; oid: number }>> {
+    try {
+      const response = await this.infoRequest('openOrders', { user: this.accountAddress });
+      return response || [];
+    } catch (error) {
+      this.logger.error({ error }, 'Failed to get open orders');
+      return [];
     }
+  }
 
-    return await this.exchangeRequest(cancelAction);
+  // Cancel all orders for a coin (or all coins if not specified)
+  async cancelAllOrders(coin?: string): Promise<void> {
+    try {
+      // Get all open orders
+      const openOrders = await this.getOpenOrders();
+
+      // Filter by coin if specified
+      const ordersToCancel = coin
+        ? openOrders.filter(order => order.coin === coin)
+        : openOrders;
+
+      if (ordersToCancel.length === 0) {
+        this.logger.debug({ coin }, 'No open orders to cancel');
+        return;
+      }
+
+      // Cancel each order
+      for (const order of ordersToCancel) {
+        try {
+          await this.cancelOrder(order.coin, order.oid);
+          this.logger.info(`Cancelled order ${order.oid} for ${order.coin}`);
+        } catch (cancelError) {
+          this.logger.error({ cancelError, order }, `Failed to cancel order ${order.oid}`);
+        }
+      }
+    } catch (error) {
+      this.logger.error({ error }, 'Failed to cancel all orders');
+      throw error;
+    }
   }
 
   // Get latest candle from Hyperliquid (includes volume)

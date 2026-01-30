@@ -97,10 +97,11 @@ class HyperliquidBot implements BotStatusProvider {
       logger.info('📊 Loading historical data...');
       for (const symbol of config.tradingPairs) {
         try {
+          // Need 250+ candles for EMA200 calculation (EMA stack requires 200+ data points)
           const historicalCandles = await this.binanceData.getHistoricalCandles(
             symbol,
             '5m',
-            Math.max(100, config.lookbackPeriod * 2)
+            Math.max(250, config.lookbackPeriod * 2)
           );
 
           if (historicalCandles.length > 0) {
@@ -113,6 +114,15 @@ class HyperliquidBot implements BotStatusProvider {
           logger.error({ error, symbol }, `Failed to load historical data for ${symbol}`);
         }
       }
+
+      // Cancel any orphaned open orders from previous runs
+      logger.info('🧹 Cleaning up orphaned orders...');
+      try {
+        await this.client.cancelAllOrders(); // Cancel all open orders
+      } catch (error) {
+        logger.error({ error }, 'Failed to cancel orphaned orders');
+      }
+      logger.info('✅ Order cleanup complete');
 
       this.isRunning = true;
 

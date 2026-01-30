@@ -4,6 +4,12 @@ import { Environment } from '../core/exchange/types';
 
 dotenvConfig();
 
+// Per-symbol override settings (for meme coins with different risk profiles)
+export interface SymbolOverride {
+  trailingStopPercent: number;
+  takeProfitPercent: number;
+}
+
 export interface Config {
   // API Configuration
   privateKey: string;
@@ -30,6 +36,11 @@ export interface Config {
   useScalping: boolean;
   breakoutBuffer: number;
   takeProfitPercent?: number;
+  longOnly: boolean;
+  minMomentumScore: number;
+
+  // Per-symbol overrides (e.g., meme coins with tighter stops)
+  symbolOverrides: Map<string, SymbolOverride>;
 
   // Trend Following Strategy
   enableTrendFollowing: boolean;
@@ -160,6 +171,8 @@ export function loadConfig(): Config {
     takeProfitPercent: process.env.TAKE_PROFIT_PERCENT
       ? getEnvNumber('TAKE_PROFIT_PERCENT', 3)
       : undefined,
+    longOnly: getEnvBoolean('LONG_ONLY', false),
+    minMomentumScore: getEnvNumber('MIN_MOMENTUM_SCORE', 0.70),
 
     // Trend Following Strategy
     enableTrendFollowing: getEnvBoolean('ENABLE_TREND_FOLLOWING', false),
@@ -183,12 +196,44 @@ export function loadConfig(): Config {
 
     // Data Source
     binanceBaseUrl: getEnvVar('BINANCE_BASE_URL', 'https://api.binance.com'),
+
+    // Per-symbol overrides for meme coins (tighter stops)
+    // Format: MEME_COINS_CONFIG=SHIB:3:2,BONK:3:2 (symbol:SL%:TP%)
+    symbolOverrides: parseSymbolOverrides(process.env.MEME_COINS_CONFIG || ''),
   };
 
   // Validate configuration
   validateConfig(config);
 
   return config;
+}
+
+function parseSymbolOverrides(configStr: string): Map<string, SymbolOverride> {
+  const overrides = new Map<string, SymbolOverride>();
+
+  if (!configStr || configStr.trim() === '') {
+    return overrides;
+  }
+
+  // Format: SHIB:3:2,BONK:3:2 (symbol:SL%:TP%)
+  const pairs = configStr.split(',');
+  for (const pair of pairs) {
+    const parts = pair.trim().split(':');
+    if (parts.length === 3) {
+      const symbol = parts[0].trim().toUpperCase();
+      const slPercent = parseFloat(parts[1]);
+      const tpPercent = parseFloat(parts[2]);
+
+      if (!isNaN(slPercent) && !isNaN(tpPercent)) {
+        overrides.set(symbol, {
+          trailingStopPercent: slPercent,
+          takeProfitPercent: tpPercent,
+        });
+      }
+    }
+  }
+
+  return overrides;
 }
 
 export const config = loadConfig();
