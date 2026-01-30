@@ -446,9 +446,9 @@ export class BreakoutStrategy {
         // Calculate RSI early for filtering
         const rsi = TechnicalIndicators.calculateRSI(history);
 
-        // RSI Filter - avoid buying overbought, avoid shorting oversold
+        // RSI Filter - avoid buying overbought, avoid shorting oversold/extended
         const RSI_OVERBOUGHT = 70;
-        const RSI_OVERSOLD = 30;
+        const RSI_OVERSOLD = 45; // Raised from 30 to avoid shorting extended moves
 
         if (breakout === 'BULLISH' && rsi.greaterThan(RSI_OVERBOUGHT)) {
           this.logger.info(`${symbol}: BULLISH signal REJECTED - RSI ${rsi.toFixed(2)} > ${RSI_OVERBOUGHT} (overbought)`);
