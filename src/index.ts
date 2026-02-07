@@ -45,6 +45,7 @@ class HyperliquidBot implements BotStatusProvider {
       {
         lookbackPeriod: config.lookbackPeriod,
         volumeMultiplier: config.volumeMultiplier,
+        volMin3Threshold: config.volMin3Threshold,
         trailingStopPercent: config.trailingStopPercent,
         positionSize: config.positionSize,
         useScalping: config.useScalping,

@@ -11,6 +11,7 @@ import { BinanceDataService } from '../../services/data/BinanceDataService';
 export interface BreakoutConfig {
   lookbackPeriod: number;
   volumeMultiplier: number;
+  volMin3Threshold: number;
   trailingStopPercent: number;
   positionSize: Decimal;
   useScalping: boolean;
@@ -56,7 +57,7 @@ export class BreakoutStrategy {
       this.logger.debug(`${symbol}: Using custom SL ${override.trailingStopPercent}% (meme coin override)`);
       return override.trailingStopPercent;
     }
-    return 5; // Default 5% for normal pairs
+    return this.config.trailingStopPercent; // From config (TRAILING_STOP_PERCENT env var)
   }
 
   /**
@@ -343,15 +344,15 @@ export class BreakoutStrategy {
         }
 
         // =========================================================================
-        // SUSTAINED VOLUME CHECK - Matching Binance_Bot's vol_min3 filter
-        // Requires MINIMUM of last 3 candles to have >= 1.5x volume
+        // SUSTAINED VOLUME CHECK - Separate threshold from initial spike
+        // Requires MINIMUM of last 3 candles to have >= VOL_MIN3_THRESHOLD volume
         // This prevents entries on single volume spikes that quickly fade
         // =========================================================================
         const volMin3 = TechnicalIndicators.calculateMinVolumeRatio(history, avgVolume, 3);
-        if (volMin3.lessThan(this.config.volumeMultiplier)) {
+        if (volMin3.lessThan(this.config.volMin3Threshold)) {
           this.logger.info(
             `${symbol}: ${breakout} breakout REJECTED - sustained volume too low. ` +
-            `vol_min3=${volMin3.toFixed(2)}x (need >= ${this.config.volumeMultiplier}x for last 3 candles)`
+            `vol_min3=${volMin3.toFixed(2)}x (need >= ${this.config.volMin3Threshold}x for last 3 candles)`
           );
           return null;
         }

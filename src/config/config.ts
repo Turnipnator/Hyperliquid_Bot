@@ -32,6 +32,7 @@ export interface Config {
   // Breakout Strategy
   lookbackPeriod: number;
   volumeMultiplier: number;
+  volMin3Threshold: number;
   trailingStopPercent: number;
   useScalping: boolean;
   breakoutBuffer: number;
@@ -165,6 +166,7 @@ export function loadConfig(): Config {
     // Breakout Strategy
     lookbackPeriod: getEnvNumber('LOOKBACK_PERIOD', 10),
     volumeMultiplier: getEnvNumber('VOLUME_MULTIPLIER', 1.0), // Lowered from 1.5 - other filters provide protection
+    volMin3Threshold: getEnvNumber('VOL_MIN3_THRESHOLD', 0.5),
     trailingStopPercent: getEnvNumber('TRAILING_STOP_PERCENT', 1.5),
     useScalping: getEnvBoolean('USE_SCALPING', true),
     breakoutBuffer: getEnvNumber('BREAKOUT_BUFFER', 0.001),
