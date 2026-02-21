@@ -365,15 +365,7 @@ export class BreakoutStrategy {
         // =========================================================================
         const emaStack = TechnicalIndicators.detectEMAStack(history);
 
-        if (emaStack.trend === 'SIDEWAYS') {
-          this.logger.info(
-            `${symbol}: ${breakout} breakout REJECTED - EMA stack is SIDEWAYS (choppy market). ` +
-            `EMA20=${emaStack.ema20.toFixed(2)}, EMA50=${emaStack.ema50.toFixed(2)}, EMA200=${emaStack.ema200.toFixed(2)}`
-          );
-          return null;
-        }
-
-        // EMA stack must match signal direction
+        // For BULLISH: require full EMA stack alignment
         if (breakout === 'BULLISH' && emaStack.trend !== 'BULLISH') {
           this.logger.info(
             `${symbol}: BULLISH breakout REJECTED - EMA stack is ${emaStack.trend}, need BULLISH. ` +
@@ -382,18 +374,44 @@ export class BreakoutStrategy {
           return null;
         }
 
-        if (breakout === 'BEARISH' && emaStack.trend !== 'BEARISH') {
-          this.logger.info(
-            `${symbol}: BEARISH breakout REJECTED - EMA stack is ${emaStack.trend}, need BEARISH. ` +
-            `EMA20=${emaStack.ema20.toFixed(2)}, EMA50=${emaStack.ema50.toFixed(2)}, EMA200=${emaStack.ema200.toFixed(2)}`
-          );
-          return null;
+        // For BEARISH: allow when EMA stack is SIDEWAYS if trend confirms downtrend
+        // In slow grinds down, EMAs compress and show SIDEWAYS even though trend is clearly bearish
+        if (breakout === 'BEARISH') {
+          if (emaStack.trend === 'BULLISH') {
+            this.logger.info(
+              `${symbol}: BEARISH breakout REJECTED - EMA stack is BULLISH. ` +
+              `EMA20=${emaStack.ema20.toFixed(2)}, EMA50=${emaStack.ema50.toFixed(2)}, EMA200=${emaStack.ema200.toFixed(2)}`
+            );
+            return null;
+          }
+          if (emaStack.trend === 'SIDEWAYS' && (trend !== 'DOWNTREND' || priceStructure !== 'LOWER_LOWS')) {
+            this.logger.info(
+              `${symbol}: BEARISH breakout REJECTED - EMA stack SIDEWAYS without confirmed downtrend. ` +
+              `trend=${trend}, structure=${priceStructure}, ` +
+              `EMA20=${emaStack.ema20.toFixed(2)}, EMA50=${emaStack.ema50.toFixed(2)}, EMA200=${emaStack.ema200.toFixed(2)}`
+            );
+            return null;
+          }
         }
 
         this.logger.info(
           `${symbol}: EMA stack ${emaStack.trend} confirmed ✓ - ` +
           `EMA20=${emaStack.ema20.toFixed(2)} > EMA50=${emaStack.ema50.toFixed(2)} > EMA200=${emaStack.ema200.toFixed(2)}`
         );
+
+        // BROADER STRUCTURE CHECK - Prevent longs in wider downtrends
+        // Uses 30-candle lookback to detect if we're in a broader decline
+        // even if the short-term 10-candle structure shows HIGHER_HIGHS from a bounce
+        if (breakout === 'BULLISH') {
+          const broaderStructure = TechnicalIndicators.detectPriceStructure(history, 30);
+          if (broaderStructure === 'LOWER_LOWS') {
+            this.logger.info(
+              `${symbol}: BULLISH breakout REJECTED - broader structure (30-candle) shows LOWER_LOWS. ` +
+              `Short-term structure: ${priceStructure}`
+            );
+            return null;
+          }
+        }
 
         // STRICT TREND FILTER - Matching Binance_Bot approach
         // Require trend alignment for all signals (prevents counter-trend entries)
