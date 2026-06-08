@@ -37,6 +37,9 @@ export interface Config {
   useScalping: boolean;
   breakoutBuffer: number;
   takeProfitPercent?: number;
+  partialTakeProfitEnabled: boolean;
+  partialTakeProfitFraction: number;
+  runnerTrailingStopPercent: number;
   longOnly: boolean;
   minMomentumScore: number;
 
@@ -129,6 +132,18 @@ function validateConfig(config: Config): void {
   ) {
     throw new Error('TAKE_PROFIT_PERCENT must be between 0 and 1000');
   }
+  if (
+    config.partialTakeProfitFraction <= 0 ||
+    config.partialTakeProfitFraction >= 1
+  ) {
+    throw new Error('PARTIAL_TP_FRACTION must be between 0 and 1 (exclusive)');
+  }
+  if (
+    config.runnerTrailingStopPercent <= 0 ||
+    config.runnerTrailingStopPercent >= 100
+  ) {
+    throw new Error('RUNNER_TRAILING_STOP_PERCENT must be between 0 and 100');
+  }
 
   // Validate trading mode
   if (config.tradingMode !== 'paper' && config.tradingMode !== 'live') {
@@ -173,6 +188,11 @@ export function loadConfig(): Config {
     takeProfitPercent: process.env.TAKE_PROFIT_PERCENT
       ? getEnvNumber('TAKE_PROFIT_PERCENT', 3)
       : undefined,
+    // Partial take-profit: bank a fraction at the TP level, let the rest ("runner")
+    // ride a tighter trailing stop so winners can keep running.
+    partialTakeProfitEnabled: getEnvBoolean('PARTIAL_TP_ENABLED', true),
+    partialTakeProfitFraction: getEnvNumber('PARTIAL_TP_FRACTION', 0.5),
+    runnerTrailingStopPercent: getEnvNumber('RUNNER_TRAILING_STOP_PERCENT', 4),
     longOnly: getEnvBoolean('LONG_ONLY', false),
     minMomentumScore: getEnvNumber('MIN_MOMENTUM_SCORE', 0.70),
 

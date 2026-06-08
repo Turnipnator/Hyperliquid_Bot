@@ -13,6 +13,9 @@ services:
       - "3001:3000"  # Different port from enclave (3000)
     volumes:
       - ./logs:/app/logs
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     networks:
       - trading-bots
     logging:

@@ -1,7 +1,7 @@
 import Decimal from 'decimal.js';
 import pino from 'pino';
 import { HyperliquidClient } from '../exchange/HyperliquidClient';
-import { OrderSide, OrderType } from '../exchange/types';
+import { OrderSide, OrderType, Position } from '../exchange/types';
 import { TechnicalIndicators, PriceData } from '../indicators/TechnicalIndicators';
 import { config } from '../../config/config';
 import { HealthCheck } from '../../utils/healthCheck';
@@ -17,6 +17,9 @@ export interface BreakoutConfig {
   useScalping: boolean;
   breakoutBuffer: number;
   takeProfitPercent?: number;
+  partialTakeProfitEnabled?: boolean;
+  partialTakeProfitFraction?: number; // 0..1, portion to bank at the TP level
+  runnerTrailingStopPercent?: number; // trailing % for the remaining "runner" after partial TP
 }
 
 export interface Signal {
@@ -44,6 +47,7 @@ export class BreakoutStrategy {
   private scanCounts: Map<string, number> = new Map();
   private recentlyClosedPositions: Map<string, number> = new Map(); // Prevents duplicate close attempts
   private pendingCloseOrders: Set<string> = new Set(); // Tracks positions with pending close orders
+  private partialTpTaken: Set<string> = new Set(); // Symbols where the partial TP has fired; remainder rides the runner trail
   private readonly STOP_LOSS_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
   private readonly CLOSE_POSITION_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes to avoid duplicate closes
 
@@ -58,6 +62,23 @@ export class BreakoutStrategy {
       return override.trailingStopPercent;
     }
     return this.config.trailingStopPercent; // From config (TRAILING_STOP_PERCENT env var)
+  }
+
+  /**
+   * Trailing stop % that currently applies to a position.
+   * Before the partial TP fires this is the normal (wide) stop that acts as the
+   * protective stop-loss. Once the partial TP has been banked, the remaining
+   * "runner" rides a tighter trail so we lock in more of a continued move.
+   */
+  private effectiveTrailingStopPercent(symbol: string): number {
+    if (
+      this.config.partialTakeProfitEnabled !== false &&
+      this.partialTpTaken.has(symbol) &&
+      this.config.runnerTrailingStopPercent
+    ) {
+      return this.config.runnerTrailingStopPercent;
+    }
+    return this.getTrailingStopPercent(symbol);
   }
 
   /**
@@ -599,7 +620,7 @@ export class BreakoutStrategy {
 
       return null;
     } catch (error) {
-      this.logger.error({ error, symbol }, `Failed to generate signal for ${symbol}`);
+      this.logger.error({ error: error instanceof Error ? error.message : String(error), symbol }, `Failed to generate signal for ${symbol}`);
       return null;
     }
   }
@@ -890,6 +911,7 @@ export class BreakoutStrategy {
           this.activeSignals.delete(symbol);
           this.trailingStops.delete(symbol);
           this.recentlyClosedPositions.delete(symbol);
+          this.partialTpTaken.delete(symbol);
         }
       }
 
@@ -963,10 +985,11 @@ export class BreakoutStrategy {
         // Update trailing stop for longs
         if (position.side === OrderSide.BUY) {
           if (position.markPrice.greaterThan(trailingStop.high)) {
+            const trailPct = this.effectiveTrailingStopPercent(position.symbol);
             trailingStop.high = position.markPrice;
-            trailingStop.stop = position.markPrice.times(1 - this.getTrailingStopPercent(position.symbol) / 100);
+            trailingStop.stop = position.markPrice.times(1 - trailPct / 100);
             this.trailingStops.set(position.symbol, trailingStop);
-            this.logger.info(`Updated trailing stop for ${position.symbol} LONG: stop at ${trailingStop.stop.toFixed(2)} (${this.getTrailingStopPercent(position.symbol)}% below high of ${trailingStop.high.toFixed(2)})`);
+            this.logger.info(`Updated trailing stop for ${position.symbol} LONG: stop at ${trailingStop.stop.toFixed(2)} (${trailPct}% below high of ${trailingStop.high.toFixed(2)})`);
           }
 
           // Check if stop hit (price dropped below stop)
@@ -981,10 +1004,11 @@ export class BreakoutStrategy {
           // For shorts, we track the LOW and stop is ABOVE it
           // trailingStop.high is repurposed as "low" for shorts
           if (position.markPrice.lessThan(trailingStop.high)) {
+            const trailPct = this.effectiveTrailingStopPercent(position.symbol);
             trailingStop.high = position.markPrice; // This is actually the LOW for shorts
-            trailingStop.stop = position.markPrice.times(1 + this.getTrailingStopPercent(position.symbol) / 100);
+            trailingStop.stop = position.markPrice.times(1 + trailPct / 100);
             this.trailingStops.set(position.symbol, trailingStop);
-            this.logger.info(`Updated trailing stop for ${position.symbol} SHORT: stop at ${trailingStop.stop.toFixed(2)} (${this.getTrailingStopPercent(position.symbol)}% above low of ${trailingStop.high.toFixed(2)})`);
+            this.logger.info(`Updated trailing stop for ${position.symbol} SHORT: stop at ${trailingStop.stop.toFixed(2)} (${trailPct}% above low of ${trailingStop.high.toFixed(2)})`);
           }
 
           // Check if stop hit (price rose above stop)
@@ -997,12 +1021,23 @@ export class BreakoutStrategy {
         // Check take profit (only if we have an active signal with take profit)
         const signal = this.activeSignals.get(position.symbol);
         if (signal?.takeProfit) {
-          if (position.side === OrderSide.BUY && position.markPrice.greaterThanOrEqualTo(signal.takeProfit)) {
-            this.logger.info(`🎯 Take profit hit for ${position.symbol} at ${position.markPrice.toFixed(2)}`);
-            await this.closePosition(position.symbol, 'Take profit target reached');
-          } else if (position.side === OrderSide.SELL && position.markPrice.lessThanOrEqualTo(signal.takeProfit)) {
-            this.logger.info(`🎯 Take profit hit for ${position.symbol} at ${position.markPrice.toFixed(2)}`);
-            await this.closePosition(position.symbol, 'Take profit target reached');
+          const tpHit =
+            (position.side === OrderSide.BUY && position.markPrice.greaterThanOrEqualTo(signal.takeProfit)) ||
+            (position.side === OrderSide.SELL && position.markPrice.lessThanOrEqualTo(signal.takeProfit));
+
+          if (tpHit) {
+            const partialEnabled = this.config.partialTakeProfitEnabled !== false;
+            if (!partialEnabled) {
+              // Legacy behaviour: full exit at the TP level
+              this.logger.info(`🎯 Take profit hit for ${position.symbol} at ${position.markPrice.toFixed(2)}`);
+              await this.closePosition(position.symbol, 'Take profit target reached');
+            } else if (!this.partialTpTaken.has(position.symbol)) {
+              // Scale out: bank a fraction here, let the runner ride the tighter trail
+              const fraction = this.config.partialTakeProfitFraction ?? 0.5;
+              this.logger.info(`🎯 Take profit hit for ${position.symbol} at ${position.markPrice.toFixed(2)} - banking ${Math.round(fraction * 100)}%, runner rides ${this.config.runnerTrailingStopPercent ?? this.getTrailingStopPercent(position.symbol)}% trail`);
+              await this.partialClosePosition(position, fraction);
+            }
+            // If the partial is already taken, do nothing: the runner exits via the trailing stop.
           }
         }
 
@@ -1013,6 +1048,66 @@ export class BreakoutStrategy {
       }
     } catch (error) {
       this.logger.error({ error }, 'Failed to update trailing stops');
+    }
+  }
+
+  /**
+   * Scale out of a position: close `fraction` of the size (reduce-only) at the TP
+   * level and leave the remainder as a "runner". The position is NOT marked as
+   * fully closed - it keeps being monitored so the runner rides the (tighter)
+   * runner trailing stop until that stop is hit.
+   */
+  public async partialClosePosition(position: Position, fraction: number): Promise<void> {
+    const symbol = position.symbol;
+    try {
+      // Guard against double-firing within the same cycle / before the fill settles
+      if (this.partialTpTaken.has(symbol)) {
+        return;
+      }
+
+      const closeSide = position.side === OrderSide.BUY ? OrderSide.SELL : OrderSide.BUY;
+      const closePrice = this.roundToIncrement(position.markPrice, symbol);
+      const closeQty = position.quantity.times(fraction);
+
+      await this.client.placeOrder(
+        symbol,
+        closeSide,
+        closePrice,
+        closeQty,
+        OrderType.LIMIT,
+        true // reduce-only
+      );
+
+      // Mark optimistically (mirrors how full closes set pendingCloseOrders) so we
+      // don't scale out again on the next cycle before the fill is reflected.
+      this.partialTpTaken.add(symbol);
+
+      // Immediately re-tighten the trailing stop to the runner percentage from the
+      // current high, rather than waiting for price to make a fresh high.
+      const runnerPct = this.config.runnerTrailingStopPercent ?? this.getTrailingStopPercent(symbol);
+      const trailingStop = this.trailingStops.get(symbol);
+      if (trailingStop) {
+        trailingStop.stop = position.side === OrderSide.BUY
+          ? trailingStop.high.times(1 - runnerPct / 100)
+          : trailingStop.high.times(1 + runnerPct / 100);
+        this.trailingStops.set(symbol, trailingStop);
+        this.logger.info(`Runner trailing stop set for ${symbol}: stop at ${trailingStop.stop.toFixed(2)} (${runnerPct}% from high ${trailingStop.high.toFixed(2)})`);
+      }
+
+      // Notify (P&L of the portion banked is approx. the position's unrealised PnL share)
+      if (this.telegram) {
+        await this.telegram.notifyPositionClosed(
+          symbol,
+          position.side,
+          closePrice,
+          position.unrealizedPnl.times(fraction).toNumber(),
+          `Partial TP: banked ${Math.round(fraction * 100)}%, runner riding ${runnerPct}% trail`
+        );
+      }
+
+      this.logger.info(`✅ Scaled out ${Math.round(fraction * 100)}% of ${symbol} at ${closePrice.toFixed(2)} - runner riding ${runnerPct}% trail`);
+    } catch (error) {
+      this.logger.error({ error, symbol }, `Failed to partial-close position for ${symbol}`);
     }
   }
 

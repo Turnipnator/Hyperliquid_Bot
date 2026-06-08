@@ -20,6 +20,8 @@ class HyperliquidBot implements BotStatusProvider {
   private isRunning: boolean = false;
   private mainLoopInterval: NodeJS.Timeout | null = null;
   private trailingStopInterval: NodeJS.Timeout | null = null;
+  private consecutiveErrors: number = 0;
+  private lastErrorNotification: number = 0;
 
   constructor() {
     // Initialize Hyperliquid client
@@ -51,6 +53,9 @@ class HyperliquidBot implements BotStatusProvider {
         useScalping: config.useScalping,
         breakoutBuffer: config.breakoutBuffer,
         takeProfitPercent: config.takeProfitPercent,
+        partialTakeProfitEnabled: config.partialTakeProfitEnabled,
+        partialTakeProfitFraction: config.partialTakeProfitFraction,
+        runnerTrailingStopPercent: config.runnerTrailingStopPercent,
       },
       this.telegram  // Pass Telegram service to strategy
     );
@@ -229,12 +234,8 @@ class HyperliquidBot implements BotStatusProvider {
             const signal = await this.strategy.generateSignal(symbol);
 
             if (signal) {
-              // Check risk before executing
-              const requiredMargin = signal.entryPrice.times(this.riskManager.calculatePositionSize(
-                balance,
-                signal.entryPrice,
-                signal.stopLoss
-              ));
+              // Check risk before executing - use actual position size (USD) as margin requirement
+              const requiredMargin = config.positionSize;
 
               if (this.riskManager.canOpenPosition(positions, balance, requiredMargin)) {
                 logger.info(`📈 Executing signal for ${symbol}`);
@@ -257,10 +258,31 @@ class HyperliquidBot implements BotStatusProvider {
         dailyPnl: metrics.dailyPnl.toFixed(2),
         riskScore: metrics.riskScore,
       }, 'Bot status');
+      // Reset consecutive error count on success
+      this.consecutiveErrors = 0;
     } catch (error) {
-      logger.error({ error }, 'Error in main loop');
-      if (this.telegram) {
-        await this.telegram.notifyError(`Main loop error: ${error}`, 'mainLoop');
+      this.consecutiveErrors++;
+      const errorMsg = String(error);
+      const isTransient = errorMsg.includes('EAI_AGAIN') || errorMsg.includes('ENOTFOUND') || errorMsg.includes('ETIMEDOUT') || errorMsg.includes('ECONNRESET');
+
+      if (isTransient) {
+        logger.warn({ error, consecutiveErrors: this.consecutiveErrors }, 'Transient network error in main loop');
+      } else {
+        logger.error({ error }, 'Error in main loop');
+      }
+
+      // Only send Telegram alert if: non-transient error, OR transient error persisting for 5+ minutes (5 consecutive failures)
+      // Also enforce a 5-minute cooldown between error notifications
+      const now = Date.now();
+      const cooldownMs = 5 * 60 * 1000;
+      const shouldNotify = (!isTransient || this.consecutiveErrors >= 5) && (now - this.lastErrorNotification > cooldownMs);
+
+      if (this.telegram && shouldNotify) {
+        this.lastErrorNotification = now;
+        await this.telegram.notifyError(
+          `Main loop error (${this.consecutiveErrors} consecutive): ${error}`,
+          'mainLoop'
+        );
       }
     }
   }

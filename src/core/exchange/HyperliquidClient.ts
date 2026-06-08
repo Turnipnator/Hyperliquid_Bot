@@ -267,11 +267,27 @@ export class HyperliquidClient {
     return asset.szDecimals;
   }
 
+  // Normalize a number string to remove trailing zeros, matching Python SDK's float_to_wire
+  private floatToWire(value: Decimal): string {
+    const str = value.toString();
+    if (str.includes('.')) {
+      return str.replace(/0+$/, '').replace(/\.$/, '');
+    }
+    return str;
+  }
+
   // Round size to correct decimal places for the asset
+  // Must strip trailing zeros to match Hyperliquid's expected format (Python SDK uses Decimal.normalize())
+  // Trailing zeros change the msgpack hash, which invalidates the signature
   private roundSize(size: Decimal, coin: string): string {
     const szDecimals = this.getSzDecimals(coin);
     // Round DOWN to avoid exceeding available balance
-    return size.toFixed(szDecimals, Decimal.ROUND_DOWN);
+    const fixed = size.toFixed(szDecimals, Decimal.ROUND_DOWN);
+    // Strip trailing zeros after decimal point to match Python SDK's float_to_wire format
+    if (fixed.includes('.')) {
+      return fixed.replace(/0+$/, '').replace(/\.$/, '');
+    }
+    return fixed;
   }
 
   // Place an order
@@ -297,7 +313,7 @@ export class HyperliquidClient {
         {
           a: asset,
           b: side === OrderSide.BUY,
-          p: price.toString(),
+          p: this.floatToWire(price),
           s: roundedSize,
           r: reduceOnly,
           t: { limit: { tif: timeInForce } },
