@@ -5,7 +5,14 @@ description: Run a comprehensive health check on the Hyperliquid trading bot
 
 # Hyperliquid Trading Bot Health Check
 
-Run a comprehensive health check on the hyperliquid-trading-bot. Work through each section systematically and provide a summary dashboard at the end.
+Run a comprehensive health check on the hyperliquid-trading-bot. Work through each
+section systematically and provide a summary dashboard at the end.
+
+> **Important — how this bot stores state:** This bot keeps **NO data files**
+> (`state.json` / `trading_stats.json` / `positions.json` do **not** exist). All
+> truth lives in (a) the JSON logs and (b) the Hyperliquid exchange. Never `cat`
+> data files — always derive balance, positions, P&L, and signals from the logs.
+> Logs are JSON (pino): `level` 30=info, 40=warn, 50=error; `time` is epoch ms.
 
 ## VPS Details
 - Server: vmi2859456.contaboserver.net
@@ -13,86 +20,104 @@ Run a comprehensive health check on the hyperliquid-trading-bot. Work through ea
 - Container: hyperliquid-trading-bot
 - Path: /root/HYPE_Bot
 
+Run independent SSH calls in parallel where possible.
+
 ## 1. PROCESS STATUS
-- Is the bot process running? Check with `docker ps`
-- How long has it been running (uptime)?
-- Any recent restarts or crashes?
+- Is the container running, healthy, and how long for? Any restarts?
 
 ```bash
 ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker ps --format '{{.Names}}\t{{.Status}}\t{{.RunningFor}}' | grep hyperliquid"
+# Restart count + last exit (catches silent crash-loops a 'healthy' status hides):
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker inspect hyperliquid-trading-bot --format 'RestartCount={{.RestartCount}} OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} StartedAt={{.State.StartedAt}}'"
 ```
 
 ## 2. LOG ANALYSIS
-- Check the last 100 lines of logs for errors, warnings, or anomalies
-- Identify any recurring error patterns
-- Look for WebSocket connection issues
+- Recent activity, and **how recent the last error was** (count alone is
+  misleading — 50 DNS blips that all happened 2 days ago is fine).
 
 ```bash
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker logs hyperliquid-trading-bot --tail 100 2>&1"
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker logs hyperliquid-trading-bot 2>&1 | grep -iE 'error|warn|fail|disconnect|reconnect' | tail -20"
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker logs hyperliquid-trading-bot --tail 60 2>&1"
+# Error summary with recency. EAI_AGAIN = transient DNS, auto-recovers — note it but don't alarm.
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "L=\$(docker logs hyperliquid-trading-bot 2>&1); echo 'error(50) count:'; echo \"\$L\" | grep -c '\"level\":50'; echo 'EAI_AGAIN count:'; echo \"\$L\" | grep -c 'EAI_AGAIN'; echo 'last error time(ms):'; echo \"\$L\" | grep '\"level\":50' | tail -1 | grep -oE '\"time\":[0-9]+' | head -1; echo 'latest log time(ms):'; echo \"\$L\" | tail -1 | grep -oE '\"time\":[0-9]+' | head -1"
 ```
+Convert the two epoch-ms timestamps and report **"last error was N hours ago"**.
+If last error ≈ latest log → 🔴 active. If hours/days ago → 🟢 stale/recovered.
 
 ## 3. SIGNAL GENERATION
-- Is the bot actively producing trading signals?
-- What was the last signal generated and when?
-- Check data files for recent activity
+- Confirm the bot is evaluating pairs every cycle and filters are firing.
 
 ```bash
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "ls -la /root/HYPE_Bot/data/"
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot cat /app/data/state.json 2>/dev/null || echo 'No state file'"
+# Latest per-pair evaluation + any breakout signals/rejections:
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker logs hyperliquid-trading-bot 2>&1 | grep -iE 'No signal|breakout|signal|REJECTED|momentum' | tail -25"
 ```
+Healthy = fresh per-pair lines (trend/structure/volumeRatio) and breakouts being
+**correctly rejected** (low vol_min3, wrong trend) rather than silence.
 
-## 4. PERFORMANCE METRICS
-- Check current trades/positions
-- Review recent P&L if logged
-- Check open positions and unrealised P&L
+## 4. PERFORMANCE & POSITIONS (from logs, not files)
+- Balance trend, open positions, daily P&L, and recent closed trades.
 
 ```bash
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot cat /app/data/trading_stats.json 2>/dev/null || echo 'No stats file'"
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot cat /app/data/positions.json 2>/dev/null || echo 'No positions file'"
+# Current balance / positions / dailyPnl (bot prints 'Bot status' each cycle):
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker logs hyperliquid-trading-bot 2>&1 | grep 'Bot status' | tail -1"
+# Trade lifecycle events (entries, fills, trailing-stop exits, closes):
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker logs hyperliquid-trading-bot 2>&1 | grep -iE 'opened|filled|Closed position|Trailing stop hit|stop hit|take profit|RESTING' | tail -20"
 ```
+Compare balance against the last figure in `CLAUDE.local.md` to get the P&L trend.
+Repeated `RESTING ... Cancelling` for one symbol = limit orders never filling
+(price moving away) — flag as churn, not an error.
 
-## 5. SYSTEM RESOURCES
-- RAM usage, disk space, CPU usage
+## 5. WIN RATE / EDGE (best-effort from logs)
+```bash
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "L=\$(docker logs hyperliquid-trading-bot 2>&1); echo 'closes:'; echo \"\$L\" | grep -c 'Closed position'; echo 'trailing-stop exits:'; echo \"\$L\" | grep -c 'Trailing stop hit'; echo 'take-profit exits:'; echo \"\$L\" | grep -ci 'take profit'"
+```
+Logs rotate (10m×3), so counts are a window, not all-time — **say so**. If a hard
+win rate is needed, note it's only fully available via Telegram `/alltime`.
+
+## 6. SYSTEM RESOURCES (incl. swap)
+```bash
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "free -h && echo '---DISK---' && df -h / && echo '---SWAP---' && swapon --show && echo '---CPU---' && top -bn1 | head -8"
+# Container's own resource use:
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker stats hyperliquid-trading-bot --no-stream --format 'CPU={{.CPUPerc}} MEM={{.MemUsage}} ({{.MemPerc}})'"
+```
+A 2GB swapfile (swappiness=10) was added 2026-06-02 as OOM insurance — verify it's
+still present. Swap absent = 🟡 (risk of OOM-killing the container on a spike).
+
+## 7. CONFIGURATION REVIEW
+```bash
+# NOTE: the volume knob is VOLUME_MULTIPLIER (not VOLUME_THRESHOLD).
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "grep -E 'TRADING_MODE|TRADING_PAIRS|POSITION_SIZE|MAX_POSITIONS|MAX_DAILY_LOSS|MAX_LEVERAGE|VOLUME_MULTIPLIER|TRAILING_STOP_PERCENT|TAKE_PROFIT_PERCENT|LONG_ONLY|MIN_MOMENTUM_SCORE|ENABLE_' /root/HYPE_Bot/.env 2>/dev/null"
+```
+Sanity-check against `CLAUDE.local.md` "Current Bot Status". Flag drift (e.g. doc
+says POSITION_SIZE=75 but .env=50) as a note, not a failure.
+
+## 8. DEPLOYED-CODE VERIFICATION
+Per the `--no-cache` footgun in CLAUDE.local.md, confirm the running container
+actually contains recent strategy changes (don't trust that a rebuild took).
 
 ```bash
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "free -h && echo '---' && df -h / && echo '---' && top -bn1 | head -12"
+# Example: confirm the decoupled sustained-volume gate is in the running JS:
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot grep -l 'vol_min3' /app/dist/core/strategy/BreakoutStrategy.js && echo 'vol_min3 gate present' || echo 'MISSING - rebuild may not have applied'"
 ```
+Adjust the grep string to whatever the most recent code change was.
 
-## 6. CONFIGURATION REVIEW
-- Check key environment variables are set correctly
+## 9. HYPERLIQUID-SPECIFIC CHECKS
+- Exchange reachability: signing works if orders place/cancel cleanly (Section 4).
+- DNS blips to `api.hyperliquid.xyz` (EAI_AGAIN) are transient and self-heal.
+- No funding/rate-limit exposure when flat (0 positions). If positions are open,
+  note them and that funding accrues on perps held through funding intervals.
 
-```bash
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "grep -E 'ENABLE_|TRADING_PAIRS|VOLUME_THRESHOLD' /root/HYPE_Bot/.env 2>/dev/null | head -15"
-```
+## 10. RECOMMENDATIONS
+Prioritised: **P1 (Critical)** immediate, **P2 (Important)** soon, **P3 (Nice to have)**.
 
-## 7. HYPERLIQUID-SPECIFIC CHECKS
-- WebSocket connection status to exchange
-- Current open positions and unrealised P&L
-- Funding rate considerations if holding perps
-- API rate limit usage (are we near limits?)
-
-## 8. STRATEGY EDGE ASSESSMENT
-- Calculate win rate from stats
-- Is the strategy performing as expected?
-- Any parameter tweaks recommended?
-
-## 9. RECOMMENDATIONS
-Provide prioritised recommendations:
-- P1 (Critical): Issues that need immediate attention
-- P2 (Important): Should be addressed soon
-- P3 (Nice to have): Optimisations for later
-
-## 10. SUMMARY DASHBOARD
-Present a quick status summary table:
-
+## 11. SUMMARY DASHBOARD
 | Check | Status | Notes |
 |-------|--------|-------|
-| Process Running | ?/? | |
-| Logs Healthy | ?/?/? | |
-| Signals Active | ?/? | |
-| Resources OK | ?/?/? | |
-| WebSocket Connected | ?/? | |
-| Strategy Edge | ?/?/? | |
+| Process Running | 🟢/🔴 | uptime, restart count, OOMKilled |
+| Logs Healthy | 🟢/🟡/🔴 | last error age, not just count |
+| Signals Active | 🟢/🔴 | evaluating + filtering correctly |
+| Performance | 🟢/🟡/🔴 | balance trend, open positions, daily P&L |
+| Resources (incl swap) | 🟢/🟡/🔴 | RAM/disk/CPU/swap |
+| Deployed Code Current | 🟢/🔴 | running JS matches latest change |
+| Strategy Edge | 🟢/🟡/🔴 | win rate window, disciplined rejects |
 
-Traffic light summary: ? All good / ? Minor issues / ? Needs attention
+Traffic light: 🟢 All good / 🟡 Minor issues / 🔴 Needs attention
