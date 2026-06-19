@@ -66,6 +66,32 @@ Compare balance against the last figure in `CLAUDE.local.md` to get the P&L tren
 Repeated `RESTING ... Cancelling` for one symbol = limit orders never filling
 (price moving away) — flag as churn, not an error.
 
+## 4A. ORDER EXECUTION HEALTH — does signing actually work?
+**The #1 silent killer.** The bot can look perfectly "healthy" — running, generating
+signals, filtering correctly — while **every single order is rejected**. This happens
+when the Hyperliquid API/agent wallet's approval lapses (they expire). Symptom:
+`"User or API Wallet 0x… does not exist."` on every entry AND exit. Caught us
+2026-06-19: an ETH long's trailing stop fired 7,900+ times over ~22h, every close
+rejected, position left unprotected — yet `docker ps` said "healthy".
+
+```bash
+# Order-rejection count + age of the most recent failure:
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "L=\$(docker logs hyperliquid-trading-bot 2>&1); echo 'order failures:'; echo \"\$L\" | grep -ciE 'does not exist|Failed to execute signal|Failed to close position'; echo 'last failure time(ms):'; echo \"\$L\" | grep -iE 'does not exist|Failed to execute signal|Failed to close position' | tail -1 | grep -oE '\"time\":[0-9]+' | head -1"
+# Are there ANY approved API/agent wallets on the master account? (read-only, no signing)
+# Empty [] = NO agent approved = every order WILL fail. This is definitive.
+curl -s -X POST https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' -d '{"type":"extraAgents","user":"0xd6b199946b3e34f239f606da0a8024b8ecd390f5"}'
+# Ground-truth open positions / account value / liq price (read-only, no signing):
+curl -s -X POST https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' -d '{"type":"clearinghouseState","user":"0xd6b199946b3e34f239f606da0a8024b8ecd390f5"}' | python3 -m json.tool
+```
+- `extraAgents` → `[]` means **no approved API wallet** → 🔴 execution dead. Fix is on
+  app.hyperliquid.xyz (API → Generate → Authorize); the **master wallet signs it**.
+  Claude CANNOT do this (no master key, by design) — it's a user action. Then update
+  `HYPERLIQUID_PRIVATE_KEY` in `.env` and `down && up`.
+- If failure last-time ≈ latest log time → 🔴 broken RIGHT NOW (not a stale blip).
+- A repeated `Trailing stop hit` for the SAME symbol every ~10s, each paired with an
+  order failure = a position whose stop can't execute. Use `clearinghouseState` above
+  for its real unrealizedPnl and `liquidationPx` (null = no liq risk) to gauge urgency.
+
 ## 5. WIN RATE / EDGE (best-effort from logs)
 ```bash
 ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "L=\$(docker logs hyperliquid-trading-bot 2>&1); echo 'closes:'; echo \"\$L\" | grep -c 'Closed position'; echo 'trailing-stop exits:'; echo \"\$L\" | grep -c 'Trailing stop hit'; echo 'take-profit exits:'; echo \"\$L\" | grep -ci 'take profit'"
@@ -114,6 +140,7 @@ Prioritised: **P1 (Critical)** immediate, **P2 (Important)** soon, **P3 (Nice to
 |-------|--------|-------|
 | Process Running | 🟢/🔴 | uptime, restart count, OOMKilled |
 | Logs Healthy | 🟢/🟡/🔴 | last error age, not just count |
+| Order Execution | 🟢/🔴 | orders place/close cleanly; API wallet approved (extraAgents != []) |
 | Signals Active | 🟢/🔴 | evaluating + filtering correctly |
 | Performance | 🟢/🟡/🔴 | balance trend, open positions, daily P&L |
 | Resources (incl swap) | 🟢/🟡/🔴 | RAM/disk/CPU/swap |
