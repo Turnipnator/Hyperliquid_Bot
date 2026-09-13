@@ -106,6 +106,8 @@ export interface HyperliquidMeta {
     name: string;
     szDecimals: number;
     maxLeverage: number;
+    isDelisted?: boolean; // delisted perps stay in the universe; orders on them are rejected
+    onlyIsolated?: boolean;
   }>;
 }
 

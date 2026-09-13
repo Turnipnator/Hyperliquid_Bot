@@ -56,6 +56,8 @@ class HyperliquidBot implements BotStatusProvider {
         partialTakeProfitEnabled: config.partialTakeProfitEnabled,
         partialTakeProfitFraction: config.partialTakeProfitFraction,
         runnerTrailingStopPercent: config.runnerTrailingStopPercent,
+        initialStopPercent: config.initialStopPercent,
+        exitSlippagePercent: config.exitSlippagePercent,
       },
       this.telegram  // Pass Telegram service to strategy
     );
@@ -84,6 +86,25 @@ class HyperliquidBot implements BotStatusProvider {
 
       // Initialize Hyperliquid client
       await this.client.initialize();
+
+      // Drop pairs the exchange will not accept orders for. Hyperliquid keeps
+      // delisted perps in its meta, so TON sat in the rotation for months after
+      // delisting - evaluated every minute, rejected on every order.
+      const untradeable = config.tradingPairs
+        .map((symbol) => ({ symbol, reason: this.client.getUntradeableReason(symbol) }))
+        .filter((pair) => pair.reason !== null);
+      for (const { symbol, reason } of untradeable) {
+        logger.warn(`⚠️ Skipping ${symbol}: ${reason} - remove it from TRADING_PAIRS`);
+      }
+      if (untradeable.length > 0) {
+        config.tradingPairs = config.tradingPairs.filter(
+          (symbol) => !untradeable.some((pair) => pair.symbol === symbol)
+        );
+        logger.info(`Tradeable pairs: ${config.tradingPairs.join(', ')}`);
+      }
+      if (config.tradingPairs.length === 0) {
+        throw new Error('No tradeable pairs left after exchange validation - check TRADING_PAIRS');
+      }
 
       // Get initial balance
       const balance = await this.client.getBalance();

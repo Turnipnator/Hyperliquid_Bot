@@ -40,6 +40,8 @@ export interface Config {
   partialTakeProfitEnabled: boolean;
   partialTakeProfitFraction: number;
   runnerTrailingStopPercent: number;
+  initialStopPercent?: number; // hard stop from entry (<= trailingStopPercent); undefined = same as trail
+  exitSlippagePercent: number; // cushion on IOC exit limits so they fill as taker
   longOnly: boolean;
   minMomentumScore: number;
 
@@ -144,6 +146,15 @@ function validateConfig(config: Config): void {
   ) {
     throw new Error('RUNNER_TRAILING_STOP_PERCENT must be between 0 and 100');
   }
+  if (
+    config.initialStopPercent !== undefined &&
+    (config.initialStopPercent <= 0 || config.initialStopPercent > config.trailingStopPercent)
+  ) {
+    throw new Error('INITIAL_STOP_PERCENT must be > 0 and <= TRAILING_STOP_PERCENT');
+  }
+  if (config.exitSlippagePercent < 0 || config.exitSlippagePercent >= 5) {
+    throw new Error('EXIT_SLIPPAGE_PERCENT must be between 0 and 5');
+  }
 
   // Validate trading mode
   if (config.tradingMode !== 'paper' && config.tradingMode !== 'live') {
@@ -193,6 +204,10 @@ export function loadConfig(): Config {
     partialTakeProfitEnabled: getEnvBoolean('PARTIAL_TP_ENABLED', true),
     partialTakeProfitFraction: getEnvNumber('PARTIAL_TP_FRACTION', 0.5),
     runnerTrailingStopPercent: getEnvNumber('RUNNER_TRAILING_STOP_PERCENT', 4),
+    initialStopPercent: process.env.INITIAL_STOP_PERCENT
+      ? getEnvNumber('INITIAL_STOP_PERCENT', 3)
+      : undefined,
+    exitSlippagePercent: getEnvNumber('EXIT_SLIPPAGE_PERCENT', 0.5),
     longOnly: getEnvBoolean('LONG_ONLY', false),
     minMomentumScore: getEnvNumber('MIN_MOMENTUM_SCORE', 0.70),
 

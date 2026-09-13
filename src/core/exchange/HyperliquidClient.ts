@@ -24,6 +24,12 @@ export interface HyperliquidConfig {
   environment: Environment;
 }
 
+// Hyperliquid perp price rule: at most 5 significant figures AND at most
+// (6 - szDecimals) decimal places; integer prices are always valid.
+// https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/tick-and-lot-size
+const PRICE_SIG_FIGS = 5;
+const PERP_PRICE_MAX_DECIMALS = 6;
+
 export class HyperliquidClient {
   private readonly wallet: ethers.Wallet;
   private readonly accountAddress: string;
@@ -267,6 +273,49 @@ export class HyperliquidClient {
     return asset.szDecimals;
   }
 
+  /**
+   * Why a symbol cannot be traded right now, or null if it can.
+   * Delisted perps (TON since mid-2026) remain in `meta`, so "is it in the
+   * universe" is not enough - every order on one is rejected by the exchange.
+   */
+  getUntradeableReason(coin: string): string | null {
+    if (!this.meta) {
+      throw new Error('Meta not loaded. Call initialize() first.');
+    }
+
+    const asset = this.meta.universe.find((u) => u.name === coin);
+    if (!asset) {
+      return 'not listed on Hyperliquid perps';
+    }
+    if (asset.isDelisted) {
+      return 'delisted on Hyperliquid perps';
+    }
+    return null;
+  }
+
+  /**
+   * Round a price to what Hyperliquid accepts for this asset.
+   * A fixed per-symbol increment silently breaks whenever an asset crosses a
+   * power of ten (ZEC > $1,000 made every order fail with "Price must be
+   * divisible by tick size"), so derive the precision from the rule instead:
+   * 5 significant figures, capped at (6 - szDecimals) decimals, integers as-is.
+   */
+  roundPrice(price: Decimal, coin: string): Decimal {
+    if (!price.isFinite() || price.lte(0)) {
+      return price;
+    }
+
+    // Above 99,999 an integer keeps more precision than 5 s.f. and is always allowed
+    if (price.gte(100000)) {
+      return price.toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
+    }
+
+    const maxDecimals = Math.max(0, PERP_PRICE_MAX_DECIMALS - this.getSzDecimals(coin));
+    return price
+      .toSignificantDigits(PRICE_SIG_FIGS, Decimal.ROUND_HALF_UP)
+      .toDecimalPlaces(maxDecimals, Decimal.ROUND_HALF_UP);
+  }
+
   // Normalize a number string to remove trailing zeros, matching Python SDK's float_to_wire
   private floatToWire(value: Decimal): string {
     const str = value.toString();
@@ -302,10 +351,21 @@ export class HyperliquidClient {
   ): Promise<HyperliquidOrderResponse> {
     const asset = this.getCoinIndex(coin);
 
-    // Round size to correct decimal places for this asset
+    // Round size and price to what this asset accepts (see roundSize / roundPrice).
+    // Every order path goes through here, so a caller can't send an invalid price.
     const roundedSize = this.roundSize(size, coin);
+    const roundedPrice = this.roundPrice(price, coin);
 
-    this.logger.info({ coin, originalSize: size.toString(), roundedSize }, 'Placing order with rounded size');
+    this.logger.info(
+      {
+        coin,
+        originalSize: size.toString(),
+        roundedSize,
+        originalPrice: price.toString(),
+        roundedPrice: roundedPrice.toString(),
+      },
+      'Placing order with rounded size and price'
+    );
 
     const orderAction = {
       type: 'order',
@@ -313,7 +373,7 @@ export class HyperliquidClient {
         {
           a: asset,
           b: side === OrderSide.BUY,
-          p: this.floatToWire(price),
+          p: this.floatToWire(roundedPrice),
           s: roundedSize,
           r: reduceOnly,
           t: { limit: { tif: timeInForce } },

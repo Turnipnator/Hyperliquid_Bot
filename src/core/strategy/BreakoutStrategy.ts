@@ -1,7 +1,7 @@
 import Decimal from 'decimal.js';
 import pino from 'pino';
 import { HyperliquidClient } from '../exchange/HyperliquidClient';
-import { OrderSide, OrderType, Position } from '../exchange/types';
+import { OrderSide, OrderType, Position, TimeInForce } from '../exchange/types';
 import { TechnicalIndicators, PriceData } from '../indicators/TechnicalIndicators';
 import { config } from '../../config/config';
 import { HealthCheck } from '../../utils/healthCheck';
@@ -20,6 +20,8 @@ export interface BreakoutConfig {
   partialTakeProfitEnabled?: boolean;
   partialTakeProfitFraction?: number; // 0..1, portion to bank at the TP level
   runnerTrailingStopPercent?: number; // trailing % for the remaining "runner" after partial TP
+  initialStopPercent?: number; // hard stop distance from entry; the trail only ever tightens from here
+  exitSlippagePercent?: number; // cushion applied to IOC exit limits (default 0.5%)
 }
 
 export interface Signal {
@@ -47,9 +49,11 @@ export class BreakoutStrategy {
   private scanCounts: Map<string, number> = new Map();
   private recentlyClosedPositions: Map<string, number> = new Map(); // Prevents duplicate close attempts
   private pendingCloseOrders: Set<string> = new Set(); // Tracks positions with pending close orders
+  private pendingCloseSince: Map<string, number> = new Map(); // When the close was reported filled; re-validated if the position lingers
   private partialTpTaken: Set<string> = new Set(); // Symbols where the partial TP has fired; remainder rides the runner trail
   private readonly STOP_LOSS_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
   private readonly CLOSE_POSITION_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes to avoid duplicate closes
+  private readonly PENDING_CLOSE_TIMEOUT_MS = 2 * 60 * 1000; // if a position still exists this long after a close, re-arm the stop checks
 
   /**
    * Get trailing stop percentage for a symbol
@@ -62,6 +66,45 @@ export class BreakoutStrategy {
       return override.trailingStopPercent;
     }
     return this.config.trailingStopPercent; // From config (TRAILING_STOP_PERCENT env var)
+  }
+
+  /**
+   * Hard initial stop distance from entry (INITIAL_STOP_PERCENT). The trail only
+   * tightens from the peak, so on a trade that never runs it would let a loser
+   * reach the full trail width; this caps that (e.g. 3%) while the trail still
+   * ratchets up behind new highs. Never wider than the symbol's trail width.
+   */
+  private getInitialStopPercent(symbol: string): number {
+    const trail = this.getTrailingStopPercent(symbol);
+    const initial = this.config.initialStopPercent;
+    if (initial === undefined || initial <= 0) {
+      return trail;
+    }
+    return Math.min(initial, trail);
+  }
+
+  /**
+   * Exit limit price for an IOC close: a small cushion through the mark so the
+   * order crosses the spread and fills as taker at the best available price.
+   * If the mark snapshot is bad the IOC simply does not match and we retry.
+   */
+  private exitLimitPrice(position: Position): Decimal {
+    const slip = (this.config.exitSlippagePercent ?? 0.5) / 100;
+    const raw = position.side === OrderSide.BUY
+      ? position.markPrice.times(1 - slip)
+      : position.markPrice.times(1 + slip);
+    return this.roundToIncrement(raw, position.symbol);
+  }
+
+  /**
+   * Ratchet a stop: longs only ever move the stop up, shorts only ever down.
+   * Keeps the hard initial stop in force until the trail overtakes it.
+   */
+  private ratchetStop(side: OrderSide, current: Decimal, candidate: Decimal): Decimal {
+    if (side === OrderSide.BUY) {
+      return candidate.greaterThan(current) ? candidate : current;
+    }
+    return candidate.lessThan(current) ? candidate : current;
   }
 
   /**
@@ -102,29 +145,13 @@ export class BreakoutStrategy {
     this.dataService = new BinanceDataService(config.binanceBaseUrl);
   }
 
+  /**
+   * Round a price to what Hyperliquid accepts for this asset (5 significant
+   * figures, decimals capped by szDecimals). The exchange client owns the rule
+   * so entries, exits and the logged stop levels all agree with the wire price.
+   */
   private roundToIncrement(price: Decimal, symbol: string): Decimal {
-    let increment: number;
-
-    // Price increments for Hyperliquid markets
-    if (symbol === 'BTC') {
-      increment = 1; // Whole dollars
-    } else if (symbol === 'ETH') {
-      increment = 0.1; // 1 decimal place
-    } else if (symbol === 'SOL' || symbol === 'BNB' || symbol === 'AVAX') {
-      increment = 0.01; // 2 decimal places
-    } else if (symbol === 'LINK' || symbol === 'HYPE') {
-      increment = 0.001; // 3 decimal places
-    } else if (symbol === 'XRP' || symbol === 'SUI') {
-      increment = 0.0001; // 4 decimal places
-    } else if (symbol === 'SHIB' || symbol === 'BONK') {
-      increment = 0.00000001; // 8 decimal places for meme coins
-    } else {
-      increment = 0.001; // Default to 3 decimal places
-    }
-
-    const priceNumber = price.toNumber();
-    const rounded = Math.round(priceNumber / increment) * increment;
-    return new Decimal(rounded.toFixed(8));
+    return this.client.roundPrice(price, symbol);
   }
 
   public async updatePriceHistory(symbol: string): Promise<void> {
@@ -522,11 +549,11 @@ export class BreakoutStrategy {
 
         const side = breakout === 'BULLISH' ? OrderSide.BUY : OrderSide.SELL;
         const entryPrice = currentPrice;
-        const trailingStopPct = this.getTrailingStopPercent(symbol);
+        const initialStopPct = this.getInitialStopPercent(symbol);
         const stopLoss =
           breakout === 'BULLISH'
-            ? entryPrice.times(1 - trailingStopPct / 100)
-            : entryPrice.times(1 + trailingStopPct / 100);
+            ? entryPrice.times(1 - initialStopPct / 100)
+            : entryPrice.times(1 + initialStopPct / 100);
 
         let confidence = 0.7;
 
@@ -692,7 +719,7 @@ export class BreakoutStrategy {
           if (distanceFromHigh.lessThanOrEqualTo(maxDistanceFromHigh)) {
             if (priceStructure === 'LOWER_LOWS') {
               const entryPrice = currentPrice;
-              const stopLoss = entryPrice.times(1 + this.getTrailingStopPercent(symbol) / 100);
+              const stopLoss = entryPrice.times(1 + this.getInitialStopPercent(symbol) / 100);
 
               const rsi = TechnicalIndicators.calculateRSI(history);
 
@@ -724,7 +751,7 @@ export class BreakoutStrategy {
           if (distanceFromLow.lessThanOrEqualTo(maxDistanceFromHigh)) {
             if (priceStructure === 'HIGHER_HIGHS') {
               const entryPrice = currentPrice;
-              const stopLoss = entryPrice.times(1 - this.getTrailingStopPercent(symbol) / 100);
+              const stopLoss = entryPrice.times(1 - this.getInitialStopPercent(symbol) / 100);
 
               const rsi = TechnicalIndicators.calculateRSI(history);
 
@@ -849,24 +876,26 @@ export class BreakoutStrategy {
       };
       this.activeSignals.set(signal.symbol, filledSignal);
 
-      // Initialize trailing stop with actual fill price
+      // Initialize the stop at the hard initial distance from the actual fill price.
+      // The trail (getTrailingStopPercent) then ratchets it up from each new peak.
+      const initialStopPct = this.getInitialStopPercent(signal.symbol);
       const trailingStopPct = this.getTrailingStopPercent(signal.symbol);
       if (signal.side === OrderSide.BUY) {
         // For longs: track the high, stop is below
-        const newStop = avgFillPrice.times(1 - trailingStopPct / 100);
+        const newStop = avgFillPrice.times(1 - initialStopPct / 100);
         this.trailingStops.set(signal.symbol, {
           high: avgFillPrice,
           stop: newStop,
         });
-        this.logger.info(`Initialized trailing stop for ${signal.symbol} LONG: stop at ${newStop.toFixed(2)} (tracking high from ${avgFillPrice.toFixed(2)})`);
+        this.logger.info(`Initialized trailing stop for ${signal.symbol} LONG: stop at ${newStop.toFixed(2)} (hard ${initialStopPct}% below entry ${avgFillPrice.toFixed(2)}; trails ${trailingStopPct}% from peak)`);
       } else {
         // For shorts: track the low (stored in 'high' field), stop is above
-        const newStop = avgFillPrice.times(1 + trailingStopPct / 100);
+        const newStop = avgFillPrice.times(1 + initialStopPct / 100);
         this.trailingStops.set(signal.symbol, {
           high: avgFillPrice, // This is the LOW for shorts
           stop: newStop,      // Stop is above entry for shorts
         });
-        this.logger.info(`Initialized trailing stop for ${signal.symbol} SHORT: stop at ${newStop.toFixed(2)} (tracking low from ${avgFillPrice.toFixed(2)})`);
+        this.logger.info(`Initialized trailing stop for ${signal.symbol} SHORT: stop at ${newStop.toFixed(2)} (hard ${initialStopPct}% above entry ${avgFillPrice.toFixed(2)}; trails ${trailingStopPct}% from trough)`);
       }
 
       // Recalculate take profit based on actual fill price
@@ -908,6 +937,7 @@ export class BreakoutStrategy {
           // Position is gone - close order filled successfully
           this.logger.info(`Position ${symbol} confirmed closed - clearing pending order and cleanup`);
           this.pendingCloseOrders.delete(symbol);
+          this.pendingCloseSince.delete(symbol);
           this.activeSignals.delete(symbol);
           this.trailingStops.delete(symbol);
           this.recentlyClosedPositions.delete(symbol);
@@ -929,17 +959,35 @@ export class BreakoutStrategy {
           }
         }
 
-        // Skip positions with pending close orders to prevent loop
+        // Skip positions with pending close orders to prevent loop - but only for a
+        // bounded time. If the position is still here after PENDING_CLOSE_TIMEOUT_MS the
+        // close did not stick (partial fill, resting order, exchange lag): cancel anything
+        // resting for the symbol, drop the flags and fall through so the stop/TP checks
+        // run again on this tick. This is what left a SUI runner unprotected for 12 days
+        // in Aug 2026 (GTC close at a bad mark snapshot never filled, flag never cleared).
         if (this.pendingCloseOrders.has(position.symbol)) {
-          this.logger.debug(`Skipping ${position.symbol} - has pending close order`);
-          continue;
+          const since = this.pendingCloseSince.get(position.symbol) ?? 0;
+          const waited = Date.now() - since;
+          if (waited < this.PENDING_CLOSE_TIMEOUT_MS) {
+            this.logger.debug(`Skipping ${position.symbol} - has pending close order`);
+            continue;
+          }
+          this.logger.warn(`⚠️ ${position.symbol} still open ${Math.round(waited / 1000)}s after its close order - clearing pending-close flag and re-checking stops`);
+          this.pendingCloseOrders.delete(position.symbol);
+          this.pendingCloseSince.delete(position.symbol);
+          this.recentlyClosedPositions.delete(position.symbol);
+          try {
+            await this.client.cancelAllOrders(position.symbol);
+          } catch (cancelError) {
+            this.logger.error({ cancelError, symbol: position.symbol }, 'Failed to cancel stale orders for lingering position');
+          }
         }
 
         let trailingStop = this.trailingStops.get(position.symbol);
 
         // Initialize trailing stop and take profit for orphan positions (positions without tracking)
         if (!trailingStop) {
-          const stopPercent = this.getTrailingStopPercent(position.symbol);
+          const stopPercent = this.getInitialStopPercent(position.symbol);
           if (position.side === OrderSide.BUY) {
             // For longs: stop is below entry
             trailingStop = {
@@ -987,9 +1035,15 @@ export class BreakoutStrategy {
           if (position.markPrice.greaterThan(trailingStop.high)) {
             const trailPct = this.effectiveTrailingStopPercent(position.symbol);
             trailingStop.high = position.markPrice;
-            trailingStop.stop = position.markPrice.times(1 - trailPct / 100);
+            const candidate = position.markPrice.times(1 - trailPct / 100);
+            const moved = candidate.greaterThan(trailingStop.stop);
+            trailingStop.stop = this.ratchetStop(OrderSide.BUY, trailingStop.stop, candidate);
             this.trailingStops.set(position.symbol, trailingStop);
-            this.logger.info(`Updated trailing stop for ${position.symbol} LONG: stop at ${trailingStop.stop.toFixed(2)} (${trailPct}% below high of ${trailingStop.high.toFixed(2)})`);
+            if (moved) {
+              this.logger.info(`Updated trailing stop for ${position.symbol} LONG: stop at ${trailingStop.stop.toFixed(2)} (${trailPct}% below high of ${trailingStop.high.toFixed(2)})`);
+            } else {
+              this.logger.info(`New high for ${position.symbol} LONG at ${trailingStop.high.toFixed(2)} - trailing stop for ${position.symbol} held at ${trailingStop.stop.toFixed(2)} (hard stop still tighter than ${trailPct}% trail)`);
+            }
           }
 
           // Check if stop hit (price dropped below stop)
@@ -1006,9 +1060,15 @@ export class BreakoutStrategy {
           if (position.markPrice.lessThan(trailingStop.high)) {
             const trailPct = this.effectiveTrailingStopPercent(position.symbol);
             trailingStop.high = position.markPrice; // This is actually the LOW for shorts
-            trailingStop.stop = position.markPrice.times(1 + trailPct / 100);
+            const candidate = position.markPrice.times(1 + trailPct / 100);
+            const moved = candidate.lessThan(trailingStop.stop);
+            trailingStop.stop = this.ratchetStop(OrderSide.SELL, trailingStop.stop, candidate);
             this.trailingStops.set(position.symbol, trailingStop);
-            this.logger.info(`Updated trailing stop for ${position.symbol} SHORT: stop at ${trailingStop.stop.toFixed(2)} (${trailPct}% above low of ${trailingStop.high.toFixed(2)})`);
+            if (moved) {
+              this.logger.info(`Updated trailing stop for ${position.symbol} SHORT: stop at ${trailingStop.stop.toFixed(2)} (${trailPct}% above low of ${trailingStop.high.toFixed(2)})`);
+            } else {
+              this.logger.info(`New low for ${position.symbol} SHORT at ${trailingStop.high.toFixed(2)} - trailing stop for ${position.symbol} held at ${trailingStop.stop.toFixed(2)} (hard stop still tighter than ${trailPct}% trail)`);
+            }
           }
 
           // Check if stop hit (price rose above stop)
@@ -1066,46 +1126,58 @@ export class BreakoutStrategy {
       }
 
       const closeSide = position.side === OrderSide.BUY ? OrderSide.SELL : OrderSide.BUY;
-      const closePrice = this.roundToIncrement(position.markPrice, symbol);
+      const closePrice = this.exitLimitPrice(position);
       const closeQty = position.quantity.times(fraction);
 
-      await this.client.placeOrder(
+      // IOC: fills immediately as taker at the best available price up to the
+      // cushioned limit, or not at all - it never rests on the book.
+      const orderResponse = await this.client.placeOrder(
         symbol,
         closeSide,
         closePrice,
         closeQty,
         OrderType.LIMIT,
-        true // reduce-only
+        true, // reduce-only
+        TimeInForce.IOC
       );
+      const orderStatus = orderResponse?.response?.data?.statuses?.[0];
+      if (!orderStatus?.filled) {
+        // Not marked as taken, so the next 10s tick retries with a fresh price
+        this.logger.warn({ orderStatus, closePrice: closePrice.toString() }, `⚠️ Partial TP order for ${symbol} did not fill (IOC) - will retry next tick`);
+        return;
+      }
+      const filledQty = new Decimal(orderStatus.filled.totalSz as string);
+      const avgFillPrice = new Decimal(orderStatus.filled.avgPx as string);
+      const bankedPnl = position.side === OrderSide.BUY
+        ? avgFillPrice.minus(position.entryPrice).times(filledQty)
+        : position.entryPrice.minus(avgFillPrice).times(filledQty);
 
-      // Mark optimistically (mirrors how full closes set pendingCloseOrders) so we
-      // don't scale out again on the next cycle before the fill is reflected.
       this.partialTpTaken.add(symbol);
 
       // Immediately re-tighten the trailing stop to the runner percentage from the
-      // current high, rather than waiting for price to make a fresh high.
+      // current high (ratchet only - never loosen) rather than waiting for a fresh high.
       const runnerPct = this.config.runnerTrailingStopPercent ?? this.getTrailingStopPercent(symbol);
       const trailingStop = this.trailingStops.get(symbol);
       if (trailingStop) {
-        trailingStop.stop = position.side === OrderSide.BUY
+        const candidate = position.side === OrderSide.BUY
           ? trailingStop.high.times(1 - runnerPct / 100)
           : trailingStop.high.times(1 + runnerPct / 100);
+        trailingStop.stop = this.ratchetStop(position.side, trailingStop.stop, candidate);
         this.trailingStops.set(symbol, trailingStop);
         this.logger.info(`Runner trailing stop set for ${symbol}: stop at ${trailingStop.stop.toFixed(2)} (${runnerPct}% from high ${trailingStop.high.toFixed(2)})`);
       }
 
-      // Notify (P&L of the portion banked is approx. the position's unrealised PnL share)
       if (this.telegram) {
         await this.telegram.notifyPositionClosed(
           symbol,
           position.side,
-          closePrice,
-          position.unrealizedPnl.times(fraction).toNumber(),
+          avgFillPrice,
+          bankedPnl.toNumber(),
           `Partial TP: banked ${Math.round(fraction * 100)}%, runner riding ${runnerPct}% trail`
         );
       }
 
-      this.logger.info(`✅ Scaled out ${Math.round(fraction * 100)}% of ${symbol} at ${closePrice.toFixed(2)} - runner riding ${runnerPct}% trail`);
+      this.logger.info(`✅ Scaled out ${filledQty} ${symbol} @ ${avgFillPrice.toFixed(4)} (banked $${bankedPnl.toFixed(2)}) - runner riding ${runnerPct}% trail`);
     } catch (error) {
       this.logger.error({ error, symbol }, `Failed to partial-close position for ${symbol}`);
     }
@@ -1128,46 +1200,65 @@ export class BreakoutStrategy {
         return;
       }
 
-      // Close position with market order
+      // Close with an IOC limit through the mark: fills as taker at the best available
+      // price, or not at all. It must never leave a resting order - a GTC close placed
+      // at a bad mark snapshot once sat unfilled for 12 days while the position ran to
+      // -11.7% with every stop check suppressed by the pending-close flag.
       const closeSide = position.side === OrderSide.BUY ? OrderSide.SELL : OrderSide.BUY;
-      const closePrice = this.roundToIncrement(position.markPrice, symbol);
+      const closePrice = this.exitLimitPrice(position);
 
-      await this.client.placeOrder(
+      const orderResponse = await this.client.placeOrder(
         symbol,
         closeSide,
         closePrice,
         position.quantity,
         OrderType.LIMIT,
-        true // reduce-only
+        true, // reduce-only
+        TimeInForce.IOC
       );
+      const orderStatus = orderResponse?.response?.data?.statuses?.[0];
+      if (!orderStatus?.filled) {
+        // Nothing is marked pending, so the next 10s tick retries with a fresh price
+        this.logger.warn({ orderStatus, closePrice: closePrice.toString() }, `⚠️ Close order for ${symbol} did not fill (IOC) - will retry next tick`);
+        return;
+      }
+      const filledQty = new Decimal(orderStatus.filled.totalSz as string);
+      const avgFillPrice = new Decimal(orderStatus.filled.avgPx as string);
+      const realizedPnl = position.side === OrderSide.BUY
+        ? avgFillPrice.minus(position.entryPrice).times(filledQty)
+        : position.entryPrice.minus(avgFillPrice).times(filledQty);
 
-      // Mark as having a pending close order to prevent re-processing
+      if (filledQty.lessThan(position.quantity)) {
+        // Don't mark pending: the remaining size still trips the same stop/TP check next tick
+        this.logger.warn(`⚠️ Close order for ${symbol} partially filled: ${filledQty} of ${position.quantity} @ ${avgFillPrice} - remainder retried next tick`);
+        return;
+      }
+
+      // Fully filled: hold the symbol as pending until the exchange stops reporting it
+      // (updateTrailingStops clears the flags then, or re-arms after PENDING_CLOSE_TIMEOUT_MS)
       this.pendingCloseOrders.add(symbol);
-      this.logger.info(`Added ${symbol} to pending close orders`);
-
-      // Mark position as recently closed to prevent duplicate close attempts
+      this.pendingCloseSince.set(symbol, Date.now());
       this.recentlyClosedPositions.set(symbol, Date.now());
 
-      // Notify
       if (this.telegram) {
         await this.telegram.notifyPositionClosed(
           symbol,
           position.side,
-          closePrice,
-          position.unrealizedPnl.toNumber(),
+          avgFillPrice,
+          realizedPnl.toNumber(),
           reason
         );
       }
 
-      // DON'T cleanup activeSignals/trailingStops here - order might not fill
-      // Cleanup will happen when position is confirmed closed
+      // DON'T cleanup activeSignals/trailingStops here - wait for the exchange to confirm
+      // the position is gone (updateTrailingStops does the cleanup)
 
       // Set cooldown if stop loss
       if (reason.includes('stop')) {
         this.stopLossCooldowns.set(symbol, Date.now());
       }
 
-      this.logger.info(`✅ Closed position for ${symbol}: ${reason}`);
+      this.logger.info(`✅ Closed position for ${symbol}: ${reason} (${filledQty} @ ${avgFillPrice.toFixed(4)}, ~$${realizedPnl.toFixed(2)})`);
     } catch (error) {
       this.logger.error({ error, symbol }, `Failed to close position for ${symbol}`);
     }

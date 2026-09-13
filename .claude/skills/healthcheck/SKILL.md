@@ -63,6 +63,13 @@ ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker logs hype
 ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker logs hyperliquid-trading-bot 2>&1 | grep -iE 'opened|filled|Closed position|Trailing stop hit|stop hit|take profit|RESTING' | tail -20"
 ```
 Compare balance against the last figure in `CLAUDE.local.md` to get the P&L trend.
+**`dailyPnl` in 'Bot status' is ALWAYS 0.00** — `RiskManager.updatePnl()` is never called, so
+the `MAX_DAILY_LOSS` cap is not enforced (confirmed 2026-09-02). Don't read 0.00 as "no losses";
+get realised P&L from the exchange instead:
+```bash
+# Realised P&L + fees from exchange fills (read-only; ~2000 most recent fills):
+curl -s -X POST https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' -d '{"type":"userFills","user":"0xd6b199946b3e34f239f606da0a8024b8ecd390f5"}' | python3 -c "import sys,json,datetime as dt;f=json.load(sys.stdin);c=dt.datetime.now().timestamp()*1000-7*86400000;r=[x for x in f if x['time']>=c];print('fills 7d:',len(r),'closedPnl $%.2f'%sum(float(x['closedPnl']) for x in r),'fees $%.2f'%sum(float(x['fee']) for x in r))"
+```
 Repeated `RESTING ... Cancelling` for one symbol = limit orders never filling
 (price moving away) — flag as churn, not an error.
 
@@ -76,21 +83,62 @@ rejected, position left unprotected — yet `docker ps` said "healthy".
 
 ```bash
 # Order-rejection count + age of the most recent failure:
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "L=\$(docker logs hyperliquid-trading-bot 2>&1); echo 'order failures:'; echo \"\$L\" | grep -ciE 'does not exist|Failed to execute signal|Failed to close position'; echo 'last failure time(ms):'; echo \"\$L\" | grep -iE 'does not exist|Failed to execute signal|Failed to close position' | tail -1 | grep -oE '\"time\":[0-9]+' | head -1"
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "L=\$(docker logs hyperliquid-trading-bot 2>&1); echo 'order failures:'; echo \"\$L\" | grep -ciE 'does not exist|Failed to execute signal|Failed to close position|Unexpected order status|divisible by tick size'; echo 'last failure time(ms):'; echo \"\$L\" | grep -iE 'does not exist|Failed to execute signal|Failed to close position|Unexpected order status|divisible by tick size' | tail -1 | grep -oE '\"time\":[0-9]+' | head -1"
 # Are there ANY approved API/agent wallets on the master account? (read-only, no signing)
 # Empty [] = NO agent approved = every order WILL fail. This is definitive.
 curl -s -X POST https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' -d '{"type":"extraAgents","user":"0xd6b199946b3e34f239f606da0a8024b8ecd390f5"}'
 # Ground-truth open positions / account value / liq price (read-only, no signing):
 curl -s -X POST https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' -d '{"type":"clearinghouseState","user":"0xd6b199946b3e34f239f606da0a8024b8ecd390f5"}' | python3 -m json.tool
 ```
-- `extraAgents` → `[]` means **no approved API wallet** → 🔴 execution dead. Fix is on
+- `extraAgents` → `[]` means **no approved API wallet** → 🔴 execution dead. If it returns an
+  agent, convert its `validUntil` (epoch ms) and report **days until expiry**; < 14 days = 🟡,
+  < 3 days = 🔴 (agents last ~90 days max; renewing is a user-only action, see below). Fix is on
   app.hyperliquid.xyz (API → Generate → Authorize); the **master wallet signs it**.
   Claude CANNOT do this (no master key, by design) — it's a user action. Then update
   `HYPERLIQUID_PRIVATE_KEY` in `.env` and `down && up`.
 - If failure last-time ≈ latest log time → 🔴 broken RIGHT NOW (not a stale blip).
+- **Exchange-side rejections look like success at a glance.** The bot logs `Order placed for X`
+  at info level even when the response carries `{"error": "..."}`, then a level-50
+  `Unexpected order status`. Caught 2026-09-13: every ZEC entry rejected with
+  `Price must be divisible by tick size` because `roundToIncrement()` hardcodes decimals per
+  symbol and Hyperliquid allows **max 5 significant figures** (ZEC went >$1,000). A rejected
+  ENTRY is a missed trade; a rejected EXIT (same helper via `exitLimitPrice()`) is an
+  unprotected position retrying every 10 s. Check the rejection's coin against
+  `clearinghouseState` — if that coin has an open position, treat as 🔴 stuck exit.
 - A repeated `Trailing stop hit` for the SAME symbol every ~10s, each paired with an
   order failure = a position whose stop can't execute. Use `clearinghouseState` above
   for its real unrealizedPnl and `liquidationPx` (null = no liq risk) to gauge urgency.
+
+## 4B. STUCK EXITS — is every open position still being protected?
+**The #2 silent killer (caught 2026-09-02).** `closePosition()` places a **GTC limit
+reduce-only order at a snapshot of the mark price**, then adds the symbol to
+`pendingCloseOrders`, which **suppresses all further stop/TP checks for that symbol
+until the position disappears**. If that limit never fills (price snapshot was stale
+during a fast move), the order rests on the book forever and the position sits with
+NO working stop. A SUI runner was left this way for 12 days (entry 0.8016, drifted to
+0.7078 = −11.7% against a "4% trail") with a resting sell at 0.9164. Nothing in
+sections 1–4A flags it: container healthy, 0 order failures, position just looks open.
+
+```bash
+# Resting orders on the exchange (read-only). The bot cancels its own unfilled ENTRY
+# orders within seconds and never intends to leave anything resting, so ANY order here
+# older than a few minutes is a stuck exit. reduceOnly=true + timestamp hours/days old = 🔴.
+curl -s -X POST https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' -d '{"type":"frontendOpenOrders","user":"0xd6b199946b3e34f239f606da0a8024b8ecd390f5"}' | python3 -c "import sys,json,datetime as dt;o=json.load(sys.stdin);print('open orders:',len(o));[print(x['coin'],x['side'],'px',x['limitPx'],'sz',x['sz'],'reduceOnly',x['reduceOnly'],'age_h=%.1f'%((dt.datetime.now().timestamp()*1000-x['timestamp'])/3.6e6)) for x in o]"
+# Cross-check: every open position should show RECENT 'trailing stop for <SYM>' activity
+# (an update or a hit). A position with zero such lines in the whole log window while its
+# price moved = the bot has stopped watching it.
+COINS=$(curl -s -X POST https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' -d '{"type":"clearinghouseState","user":"0xd6b199946b3e34f239f606da0a8024b8ecd390f5"}' | python3 -c "import sys,json;print(' '.join(p['position']['coin'] for p in json.load(sys.stdin)['assetPositions']))")
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "L=\$(docker logs hyperliquid-trading-bot 2>&1); for s in $COINS; do echo \"\$s: trailing-stop-updates=\$(echo \"\$L\" | grep -c \"trailing stop for \$s\") stop-hits=\$(echo \"\$L\" | grep -c \"Trailing stop hit for \$s\")\"; done"
+```
+- Any resting reduce-only order older than ~5 min → 🔴 **stuck exit**. The position's
+  distance from entry (from `clearinghouseState` in 4A) tells you how much it has cost.
+- **Recovery** (user decision — it realises the loss): cancel the resting order on
+  app.hyperliquid.xyz and close the position manually, OR `docker compose down && up`
+  — startup cancels all open orders and orphan-recovery re-adopts the position with a
+  stop 5% from entry, closing it on the first tick if price is already beyond that.
+- **Root cause is in code** (`BreakoutStrategy.closePosition`): a GTC limit exit with
+  no fill confirmation and a `pendingCloseOrders` flag that is never re-validated.
+  Until fixed, this check is the only thing that catches it.
 
 ## 5. WIN RATE / EDGE (best-effort from logs)
 ```bash
@@ -121,8 +169,15 @@ Per the `--no-cache` footgun in CLAUDE.local.md, confirm the running container
 actually contains recent strategy changes (don't trust that a rebuild took).
 
 ```bash
-# Example: confirm the decoupled sustained-volume gate is in the running JS:
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot grep -l 'vol_min3' /app/dist/core/strategy/BreakoutStrategy.js && echo 'vol_min3 gate present' || echo 'MISSING - rebuild may not have applied'"
+# Latest change (2026-09-13): sig-fig price rounding + delisted-pair skip (ZEC tick-size / TON fixes).
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot sh -c \"echo client=\$(grep -c 'roundPrice\|getUntradeableReason' /app/dist/core/exchange/HyperliquidClient.js) index=\$(grep -c getUntradeableReason /app/dist/index.js) oldtable=\$(grep -c 'Default to 3 decimal places' /app/dist/core/strategy/BreakoutStrategy.js)\"" 
+# Expect client>=4, index>=1, oldtable=0. Also confirm no pair is being evaluated that the exchange
+# has delisted: any 'Skipping <SYM>: delisted' warning at startup means TRADING_PAIRS needs cleaning.
+# Previous change (2026-09-02): hard initial stop + IOC exits + pending-close re-validation.
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot grep -c 'getInitialStopPercent\|TimeInForce.IOC\|PENDING_CLOSE_TIMEOUT_MS' /app/dist/core/strategy/BreakoutStrategy.js && echo 'initial-stop / IOC-exit code present' || echo 'MISSING - rebuild may not have applied'"
+# And that the env actually reached the container (restart alone does NOT reload .env):
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot printenv INITIAL_STOP_PERCENT EXIT_SLIPPAGE_PERCENT"
+# Older gate still expected: 'vol_min3' in the same file.
 ```
 Adjust the grep string to whatever the most recent code change was.
 
@@ -141,10 +196,11 @@ Prioritised: **P1 (Critical)** immediate, **P2 (Important)** soon, **P3 (Nice to
 | Process Running | 🟢/🔴 | uptime, restart count, OOMKilled |
 | Logs Healthy | 🟢/🟡/🔴 | last error age, not just count |
 | Order Execution | 🟢/🔴 | orders place/close cleanly; API wallet approved (extraAgents != []) |
+| Stuck Exits | 🟢/🔴 | no resting reduce-only orders; every open position has recent trailing-stop activity |
 | Signals Active | 🟢/🔴 | evaluating + filtering correctly |
 | Performance | 🟢/🟡/🔴 | balance trend, open positions, daily P&L |
 | Resources (incl swap) | 🟢/🟡/🔴 | RAM/disk/CPU/swap |
-| Deployed Code Current | 🟢/🔴 | running JS matches latest change |
+| Deployed Code Current | 🟢/🔴 | running JS matches latest change; INITIAL_STOP_PERCENT visible in container env |
 | Strategy Edge | 🟢/🟡/🔴 | win rate window, disciplined rejects |
 
 Traffic light: 🟢 All good / 🟡 Minor issues / 🔴 Needs attention
