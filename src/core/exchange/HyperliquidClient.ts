@@ -16,7 +16,7 @@ import {
   HyperliquidMeta,
   HyperliquidUserState,
   HyperliquidOrderResponse,
-} from './types';
+ HyperliquidFill } from './types';
 
 export interface HyperliquidConfig {
   privateKey: string;
@@ -400,6 +400,27 @@ export class HyperliquidClient {
     };
 
     return await this.exchangeRequest(cancelAction);
+  }
+
+  // Fills since a timestamp (ms), newest last. Read-only, no signing; the
+  // exchange returns at most the 2,000 most recent fills.
+  async getFillsSince(startTimeMs: number): Promise<HyperliquidFill[]> {
+    const fills = await this.infoRequest('userFillsByTime', {
+      user: this.accountAddress,
+      startTime: startTimeMs,
+    });
+    return Array.isArray(fills) ? fills : [];
+  }
+
+  /**
+   * Net realised P&L of a set of fills: closedPnl minus fees. Funding payments
+   * are not fills and are ignored (cents per day at this account size).
+   */
+  static realisedPnl(fills: HyperliquidFill[]): Decimal {
+    return fills.reduce(
+      (sum, fill) => sum.plus(fill.closedPnl || 0).minus(fill.fee || 0),
+      new Decimal(0)
+    );
   }
 
   // Get open orders

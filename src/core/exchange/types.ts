@@ -111,6 +111,20 @@ export interface HyperliquidMeta {
   }>;
 }
 
+// One entry from userFills / userFillsByTime (numeric fields arrive as strings)
+export interface HyperliquidFill {
+  coin: string;
+  dir: string;
+  side: string;
+  px: string;
+  sz: string;
+  closedPnl: string;
+  fee: string;
+  time: number;
+  oid?: number;
+  crossed?: boolean;
+}
+
 export interface HyperliquidUserState {
   assetPositions: Array<{
     position: {

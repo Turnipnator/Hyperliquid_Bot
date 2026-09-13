@@ -63,9 +63,11 @@ ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker logs hype
 ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker logs hyperliquid-trading-bot 2>&1 | grep -iE 'opened|filled|Closed position|Trailing stop hit|stop hit|take profit|RESTING' | tail -20"
 ```
 Compare balance against the last figure in `CLAUDE.local.md` to get the P&L trend.
-**`dailyPnl` in 'Bot status' is ALWAYS 0.00** — `RiskManager.updatePnl()` is never called, so
-the `MAX_DAILY_LOSS` cap is not enforced (confirmed 2026-09-02). Don't read 0.00 as "no losses";
-get realised P&L from the exchange instead:
+**`dailyPnl` in 'Bot status' is synced every minute from exchange fills** (closedPnl − fees since
+00:00 UTC) as of 2026-09-13, and `MAX_DAILY_LOSS` pauses new entries when hit — grep for
+`Daily loss limit hit`, `Daily loss limit active`, `new entries resumed`. If it reads 0.00 on a day
+that has closing fills, the sync is failing: grep `Could not sync daily P&L`. Cross-check against
+the exchange directly:
 ```bash
 # Realised P&L + fees from exchange fills (read-only; ~2000 most recent fills):
 curl -s -X POST https://api.hyperliquid.xyz/info -H 'Content-Type: application/json' -d '{"type":"userFills","user":"0xd6b199946b3e34f239f606da0a8024b8ecd390f5"}' | python3 -c "import sys,json,datetime as dt;f=json.load(sys.stdin);c=dt.datetime.now().timestamp()*1000-7*86400000;r=[x for x in f if x['time']>=c];print('fills 7d:',len(r),'closedPnl $%.2f'%sum(float(x['closedPnl']) for x in r),'fees $%.2f'%sum(float(x['fee']) for x in r))"
@@ -169,9 +171,9 @@ Per the `--no-cache` footgun in CLAUDE.local.md, confirm the running container
 actually contains recent strategy changes (don't trust that a rebuild took).
 
 ```bash
-# Latest change (2026-09-13): sig-fig price rounding + delisted-pair skip (ZEC tick-size / TON fixes).
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot sh -c \"echo client=\$(grep -c 'roundPrice\|getUntradeableReason' /app/dist/core/exchange/HyperliquidClient.js) index=\$(grep -c getUntradeableReason /app/dist/index.js) oldtable=\$(grep -c 'Default to 3 decimal places' /app/dist/core/strategy/BreakoutStrategy.js)\"" 
-# Expect client>=4, index>=1, oldtable=0. Also confirm no pair is being evaluated that the exchange
+# Latest change (2026-09-13): sig-fig price rounding + delisted-pair skip + exchange-fed daily loss cap.
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot sh -c \"echo client=\$(grep -c 'roundPrice\|getUntradeableReason' /app/dist/core/exchange/HyperliquidClient.js) index=\$(grep -c getUntradeableReason /app/dist/index.js) oldtable=\$(grep -c 'Default to 3 decimal places' /app/dist/core/strategy/BreakoutStrategy.js) dailycap=\$(grep -c isDailyLossLimitHit /app/dist/core/risk/RiskManager.js) sync=\$(grep -c syncDailyPnl /app/dist/index.js)\""
+# Expect client>=4, index>=1, oldtable=0, dailycap>=1, sync>=1. Also confirm no pair is being evaluated that the exchange
 # has delisted: any 'Skipping <SYM>: delisted' warning at startup means TRADING_PAIRS needs cleaning.
 # Previous change (2026-09-02): hard initial stop + IOC exits + pending-close re-validation.
 ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot grep -c 'getInitialStopPercent\|TimeInForce.IOC\|PENDING_CLOSE_TIMEOUT_MS' /app/dist/core/strategy/BreakoutStrategy.js && echo 'initial-stop / IOC-exit code present' || echo 'MISSING - rebuild may not have applied'"

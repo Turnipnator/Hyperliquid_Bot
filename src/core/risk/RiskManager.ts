@@ -21,15 +21,15 @@ export interface RiskMetrics {
 export class RiskManager {
   private readonly config: RiskConfig;
   private readonly logger: pino.Logger;
+  // Realised P&L for the current UTC day. Owned by setDailyPnl(), which the
+  // main loop feeds from exchange fills every minute - never tallied in memory,
+  // so it survives restarts and counts manual closes.
   private dailyPnl: Decimal = new Decimal(0);
-  private dailyPnlResetTime: Date;
   private peakBalance: Decimal = new Decimal(0);
-  private trades: Array<{ pnl: Decimal; timestamp: Date }> = [];
 
   constructor(config: RiskConfig, initialBalance?: Decimal) {
     this.config = config;
     this.logger = pino({ name: 'RiskManager' });
-    this.dailyPnlResetTime = new Date();
     if (initialBalance) {
       this.peakBalance = initialBalance;
     }
@@ -40,10 +40,8 @@ export class RiskManager {
     balance: Balance,
     requiredMargin: Decimal
   ): boolean {
-    this.resetDailyPnlIfNeeded();
-
     // Check daily loss limit
-    if (this.dailyPnl.lessThanOrEqualTo(this.config.maxDailyLoss.negated())) {
+    if (this.isDailyLossLimitHit()) {
       this.logger.warn(`Daily loss limit reached: ${this.dailyPnl}`);
       return false;
     }
@@ -111,17 +109,20 @@ export class RiskManager {
     return positionSize;
   }
 
-  public updatePnl(pnl: Decimal): void {
-    this.resetDailyPnlIfNeeded();
-    this.dailyPnl = this.dailyPnl.plus(pnl);
-    this.trades.push({ pnl, timestamp: new Date() });
+  /**
+   * Replace today's realised P&L with the figure derived from exchange fills
+   * (closedPnl minus fees since 00:00 UTC).
+   */
+  public setDailyPnl(pnl: Decimal): void {
+    this.dailyPnl = pnl;
+  }
 
-    this.logger.info(`PnL updated: Daily: ${this.dailyPnl}, Trade: ${pnl}`);
+  /** True while today's realised loss has reached MAX_DAILY_LOSS. */
+  public isDailyLossLimitHit(): boolean {
+    return this.dailyPnl.lessThanOrEqualTo(this.config.maxDailyLoss.negated());
   }
 
   public getRiskMetrics(positions: Position[], balance: Balance): RiskMetrics {
-    this.resetDailyPnlIfNeeded();
-
     const totalExposure = this.calculateTotalExposure(positions);
     const currentDrawdown = this.calculateDrawdown(balance.total);
     const riskScore = this.calculateRiskScore(positions, balance);
@@ -174,70 +175,6 @@ export class RiskManager {
     score += Math.min(drawdownRatio.toNumber() * 25, 25);
 
     return Math.round(score);
-  }
-
-  private resetDailyPnlIfNeeded(): void {
-    const now = new Date();
-    const resetTime = new Date(this.dailyPnlResetTime);
-    resetTime.setDate(resetTime.getDate() + 1);
-
-    if (now >= resetTime) {
-      this.dailyPnl = new Decimal(0);
-      this.dailyPnlResetTime = now;
-      this.trades = this.trades.filter(
-        (t) => t.timestamp >= new Date(now.getTime() - 24 * 60 * 60 * 1000)
-      );
-      this.logger.info('Daily PnL reset');
-    }
-  }
-
-  public getWinRate(): number {
-    const wins = this.trades.filter((t) => t.pnl.greaterThan(0)).length;
-    const total = this.trades.length;
-
-    if (total === 0) {
-      return 0;
-    }
-
-    return (wins / total) * 100;
-  }
-
-  public getAverageWinLoss(): { avgWin: Decimal; avgLoss: Decimal; ratio: Decimal } {
-    const wins = this.trades.filter((t) => t.pnl.greaterThan(0));
-    const losses = this.trades.filter((t) => t.pnl.lessThan(0));
-
-    const avgWin = wins.length > 0
-      ? wins.reduce((sum, t) => sum.plus(t.pnl), new Decimal(0)).dividedBy(wins.length)
-      : new Decimal(0);
-
-    const avgLoss = losses.length > 0
-      ? losses.reduce((sum, t) => sum.plus(t.pnl.abs()), new Decimal(0)).dividedBy(losses.length)
-      : new Decimal(0);
-
-    const ratio = avgLoss.isZero() ? new Decimal(0) : avgWin.dividedBy(avgLoss);
-
-    return { avgWin, avgLoss, ratio };
-  }
-
-  public shouldStopTrading(): boolean {
-    if (this.dailyPnl.lessThanOrEqualTo(this.config.maxDailyLoss.negated())) {
-      this.logger.error('EMERGENCY STOP: Daily loss limit exceeded');
-      return true;
-    }
-
-    const metrics = this.getRiskMetrics([], {
-      asset: 'USDC',
-      available: new Decimal(0),
-      locked: new Decimal(0),
-      total: new Decimal(1000)
-    });
-
-    if (metrics.riskScore > 80) {
-      this.logger.error(`EMERGENCY STOP: Risk score too high: ${metrics.riskScore}`);
-      return true;
-    }
-
-    return false;
   }
 
   public resetPeakBalance(currentBalance: Decimal): void {

@@ -50,12 +50,13 @@ signature, so it is a **user action** — Claude can only verify the result.
 Automated breakout trading bot for Hyperliquid perpetuals exchange. Uses wallet signing (EIP-712) for authentication and Binance for historical candle data.
 
 ### Current Configuration
-- **Position Size**: $50 per trade
+- **Position Size**: $75 per trade (raised from $50 on 2026-09-13)
 - **Max Positions**: 6 concurrent
 - **Volume Multiplier**: 1.5x average
 - **Initial Stop**: 3% hard from entry
 - **Trailing Stop**: 5%
-- **Max Daily Loss**: $30 (NOT enforced in code — `updatePnl()` is never called)
+- **Max Daily Loss**: $30 realised per UTC day, synced every minute from exchange fills (closedPnl − fees).
+  When hit, no new entries until 00:00 UTC; open positions are still managed. Enforced since 2026-09-13.
 - **Trading Pairs**: BTC, ETH, SOL, AVAX, BNB, SUI, LINK, XRP, TRX, ADA, HYPE, ZEC (12 pairs — TON removed 2026-09-13, delisted on Hyperliquid)
 
 ---
@@ -114,7 +115,7 @@ hyperliquid-bot/
   reported close has its resting orders cancelled and its stop checks re-armed.
 - **Take Profit**: 1.3% PARTIAL scale-out (2% for meme coins) - banks 50% of the
   position, remaining 50% "runner" rides a 4% trail (`RUNNER_TRAILING_STOP_PERCENT`)
-- **Daily Loss Limit**: $30
+- **Daily Loss Limit**: $30 realised per UTC day — pauses new entries, never force-closes or exits the process
 
 ---
 
@@ -130,9 +131,9 @@ HYPERLIQUID_ENV=MAINNET
 # Trading
 TRADING_MODE=live
 TRADING_PAIRS=BTC,ETH,SOL,AVAX,BNB,SUI,LINK,XRP,TRX,ADA,HYPE,ZEC
-POSITION_SIZE=50              # USD per position
+POSITION_SIZE=75              # USD per position (raised from 50 on 2026-09-13)
 MAX_POSITIONS=6
-MAX_DAILY_LOSS=30
+MAX_DAILY_LOSS=30             # realised loss per UTC day (exchange fills) that pauses new entries
 MAX_LEVERAGE=3
 
 # Strategy
@@ -260,7 +261,7 @@ docker logs hyperliquid-trading-bot 2>&1 | grep -i 'signal\|breakout\|rejected' 
 ### Adjust position sizing
 Edit `.env`:
 ```bash
-POSITION_SIZE=50  # USD amount per position
+POSITION_SIZE=75  # USD amount per position
 ```
 
 ### Check open positions

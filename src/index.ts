@@ -22,6 +22,7 @@ class HyperliquidBot implements BotStatusProvider {
   private trailingStopInterval: NodeJS.Timeout | null = null;
   private consecutiveErrors: number = 0;
   private lastErrorNotification: number = 0;
+  private dailyLossHaltActive: boolean = false;
 
   constructor() {
     // Initialize Hyperliquid client
@@ -224,13 +225,26 @@ class HyperliquidBot implements BotStatusProvider {
       const balance = await this.client.getBalance();
       const positions = await this.client.getPositions();
 
-      if (this.riskManager.shouldStopTrading()) {
-        logger.error('⛔ Risk manager triggered emergency stop');
+      // Daily loss cap on realised P&L since 00:00 UTC. When hit, no new
+      // entries until the next UTC day; the 10-s stop loop keeps managing and
+      // closing what is open. This must never exit the process: a container
+      // restart would have zeroed an in-memory tally and resumed trading.
+      await this.syncDailyPnl();
+      const dailyLossHit = this.riskManager.isDailyLossLimitHit();
+      if (dailyLossHit && !this.dailyLossHaltActive) {
+        this.dailyLossHaltActive = true;
+        const message = `⛔ Daily loss limit hit: ${this.riskManager.getDailyPnl().toFixed(2)} USDC realised today ` +
+          `(limit -${config.maxDailyLoss}). No new entries until 00:00 UTC; open positions are still managed.`;
+        logger.warn(message);
         if (this.telegram) {
-          await this.telegram.notifyError('Emergency stop triggered by risk manager', 'mainLoop');
+          await this.telegram.sendMessage(message);
         }
-        await this.stop();
-        return;
+      } else if (!dailyLossHit && this.dailyLossHaltActive) {
+        this.dailyLossHaltActive = false;
+        logger.info('✅ Daily loss limit cleared (new UTC day) - new entries resumed');
+        if (this.telegram) {
+          await this.telegram.sendMessage('✅ New UTC day - daily loss limit cleared, new entries resumed');
+        }
       }
 
       // Update price history for all pairs
@@ -242,8 +256,10 @@ class HyperliquidBot implements BotStatusProvider {
         }
       }
 
-      // Generate and execute signals if we have capacity
-      if (positions.length < config.maxPositions) {
+      // Generate and execute signals if we have capacity and today's loss cap is not hit
+      if (dailyLossHit) {
+        logger.debug('Daily loss limit active - skipping signal generation');
+      } else if (positions.length < config.maxPositions) {
         for (const symbol of config.tradingPairs) {
           try {
             // Skip if already have position
@@ -305,6 +321,21 @@ class HyperliquidBot implements BotStatusProvider {
           'mainLoop'
         );
       }
+    }
+  }
+
+  /**
+   * Today's realised P&L (UTC day) from exchange fills rather than an
+   * in-memory tally: survives restarts, counts manual closes, and matches what
+   * the exchange shows. If the query fails the previous figure stands.
+   */
+  private async syncDailyPnl(): Promise<void> {
+    try {
+      const startOfUtcDay = new Date().setUTCHours(0, 0, 0, 0);
+      const fills = await this.client.getFillsSince(startOfUtcDay);
+      this.riskManager.setDailyPnl(HyperliquidClient.realisedPnl(fills));
+    } catch (error) {
+      logger.warn({ error }, 'Could not sync daily P&L from exchange fills - keeping last value');
     }
   }
 
