@@ -48,3 +48,6 @@ temp/
 
 # Local Claude session notes (not committed)
 CLAUDE.local.md
+
+# Paper momentum logger state (research/paper_logger.py)
+research/*.db

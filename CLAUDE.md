@@ -148,7 +148,7 @@ PARTIAL_TP_ENABLED=true       # bank 50% at TP, let the rest run
 PARTIAL_TP_FRACTION=0.5
 RUNNER_TRAILING_STOP_PERCENT=4  # tighter trail for the post-TP runner
 MIN_MOMENTUM_SCORE=0.70
-LONG_ONLY=false               # shorting enabled
+LONG_ONLY=true                # shorts disabled 2026-10-12 (28 shorts lost $10.41; see REVIEW_MOMENTUM.md)
 USE_SCALPING=true
 BREAKOUT_BUFFER=0.001
 
