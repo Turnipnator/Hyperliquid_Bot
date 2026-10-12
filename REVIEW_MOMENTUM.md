@@ -32,6 +32,8 @@ Source of the brief: `RESEARCH_MOMENTUM_HYPERLIQUID.md` §5.
   candle that had **closed before the entry**. No look-ahead.
 - `research/backtest_momentum.py` is **missing** (`backtest_funding.py` was copied instead). I wrote
   a small independent simulator rather than wait; see section B for how closely it matches §3.
+  *Update 2026-10-12: the file has since been copied in. Run as-is it gives the §3 table exactly
+  (spot 26.8% CAGR, Sharpe 1.30, max drawdown −24.0%; perps 22.5%, 1.12, −24.8%).*
 - The two currently open longs (SOL, LINK, +$1.23 unrealised) are excluded from trade statistics.
 
 ---
