@@ -45,7 +45,8 @@ export class BinanceDataService {
       const endTime = Date.now();
       // Calculate start time based on interval and limit
       const intervalMs = this.getIntervalMs(interval);
-      const startTime = endTime - (intervalMs * limit);
+      // One extra interval: the still-forming candle is dropped below
+      const startTime = endTime - (intervalMs * (limit + 1));
 
       const response = await axios.post(
         `${this.hyperliquidUrl}/info`,
@@ -74,12 +75,23 @@ export class BinanceDataService {
         timestamp: new Date(candle.t),
       }));
 
-      this.logger.info(`Fetched ${candles.length} historical candles for ${symbol} from Hyperliquid`);
-      return candles;
+      const closed = this.closedCandles(candles, intervalMs, limit);
+      this.logger.info(`Fetched ${closed.length} historical candles for ${symbol} from Hyperliquid`);
+      return closed;
     } catch (error) {
       this.logger.error({ error, symbol }, `Failed to fetch Hyperliquid candles for ${symbol}`);
       return [];
     }
+  }
+
+  // Keep only candles that have closed, newest `limit` of them. Both APIs return the
+  // still-forming candle last; storing it froze it at its first-minute values, because
+  // updatePriceHistory() only appends timestamps it has not seen before.
+  private closedCandles(candles: PriceData[], intervalMs: number, limit: number): PriceData[] {
+    const now = Date.now();
+    return candles
+      .filter(candle => candle.timestamp.getTime() + intervalMs <= now)
+      .slice(-limit);
   }
 
   // Convert interval string to milliseconds
@@ -118,7 +130,7 @@ export class BinanceDataService {
         params: {
           symbol: binanceSymbol,
           interval,
-          limit,
+          limit: limit + 1, // the still-forming candle is dropped below
         },
         timeout: 10000,
       });
@@ -131,8 +143,9 @@ export class BinanceDataService {
         timestamp: new Date(candle[0]),
       }));
 
-      this.logger.info(`Fetched ${candles.length} historical candles for ${symbol}`);
-      return candles;
+      const closed = this.closedCandles(candles, this.getIntervalMs(interval), limit);
+      this.logger.info(`Fetched ${closed.length} historical candles for ${symbol}`);
+      return closed;
     } catch (error) {
       this.logger.error({ error, symbol }, `Failed to fetch historical candles for ${symbol}`);
       return [];
