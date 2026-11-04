@@ -7,6 +7,7 @@ import { config } from '../../config/config';
 import { HealthCheck } from '../../utils/healthCheck';
 import { TelegramService } from '../../services/telegram/TelegramService';
 import { BinanceDataService } from '../../services/data/BinanceDataService';
+import { ExitRules } from '../risk/StreakPause';
 
 export interface BreakoutConfig {
   lookbackPeriod: number;
@@ -135,6 +136,24 @@ export class BreakoutStrategy {
       return override.takeProfitPercent;
     }
     return this.config.takeProfitPercent || 1.3; // Default 1.3%
+  }
+
+  /** Exit rules a fresh position on this symbol would get (for shadow trades). */
+  public getExitRules(symbol: string): ExitRules {
+    return {
+      initialStopPercent: this.getInitialStopPercent(symbol),
+      trailingStopPercent: this.getTrailingStopPercent(symbol),
+      runnerTrailingStopPercent: this.config.runnerTrailingStopPercent ?? this.getTrailingStopPercent(symbol),
+      takeProfitPercent: this.getTakeProfitPercent(symbol),
+      partialFraction: this.config.partialTakeProfitEnabled !== false
+        ? (this.config.partialTakeProfitFraction ?? 0.5)
+        : 0,
+    };
+  }
+
+  /** Closed 5m candles held for a symbol (read-only use). */
+  public getPriceHistory(symbol: string): PriceData[] | undefined {
+    return this.priceHistory.get(symbol);
   }
 
   constructor(client: HyperliquidClient, strategyConfig: BreakoutConfig, telegram?: TelegramService) {

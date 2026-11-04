@@ -28,6 +28,7 @@ export interface Config {
   positionSize: Decimal;
   maxLeverage: number;
   maxDrawdown: Decimal;
+  streakPauseTrades: number; // 0 = off; else pause entries while the last N closed trades sum <= 0
 
   // Breakout Strategy
   lookbackPeriod: number;
@@ -117,6 +118,9 @@ function validateConfig(config: Config): void {
   if (config.maxDrawdown.lessThanOrEqualTo(0) || config.maxDrawdown.greaterThan(100)) {
     throw new Error('MAX_DRAWDOWN must be between 0 and 100');
   }
+  if (!Number.isInteger(config.streakPauseTrades) || config.streakPauseTrades < 0) {
+    throw new Error('STREAK_PAUSE_TRADES must be a whole number >= 0 (0 = off)');
+  }
 
   // Validate strategy parameters
   if (config.lookbackPeriod < 2) {
@@ -188,6 +192,7 @@ export function loadConfig(): Config {
     positionSize: getEnvDecimal('POSITION_SIZE', '10'),
     maxLeverage: getEnvNumber('MAX_LEVERAGE', 3),
     maxDrawdown: getEnvDecimal('MAX_DRAWDOWN', '10'),
+    streakPauseTrades: getEnvNumber('STREAK_PAUSE_TRADES', 0),
 
     // Breakout Strategy
     lookbackPeriod: getEnvNumber('LOOKBACK_PERIOD', 10),

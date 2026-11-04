@@ -142,6 +142,17 @@ ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "L=\$(docker logs
   no fill confirmation and a `pendingCloseOrders` flag that is never re-validated.
   Until fixed, this check is the only thing that catches it.
 
+## 4C. LOSING-STREAK PAUSE (since 2026-11-02, `STREAK_PAUSE_TRADES`)
+While paused the bot places NO new orders by design - "0 orders placed" is then correct, not a fault.
+```bash
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "L=\$(docker logs hyperliquid-trading-bot 2>&1); echo \"\$L\" | grep 'Bot status' | tail -1 | grep -oE '\"streakPaused\":[a-z]+|\"lastTradesSumPct\":\"[-0-9.]+\"|\"openShadows\":[0-9]+'; echo \"\$L\" | grep -E 'Losing-streak|Shadow trade closed|shadow trade, not executed' | cut -c1-220 | tail -15; echo 'save failures:'; echo \"\$L\" | grep -c 'Could not save shadow'; ls -la /root/HYPE_Bot/logs/streak_pause_state.json"
+```
+- Report paused/active, the last-N sum, open shadows, and each closed shadow's result (that is what the bot
+  would have made or lost). Shadow losses while paused = money the pause saved.
+- `Could not save shadow trade state` (EACCES) after the last restart = host `logs/` not owned by uid 1001 →
+  shadows lost on restart. Fix: `chown 1001 /root/HYPE_Bot/logs` (fixed once 2026-11-02 19:58).
+- State file `mtime` should be within the last few minutes.
+
 ## 5. WIN RATE / EDGE (best-effort from logs)
 ```bash
 ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "L=\$(docker logs hyperliquid-trading-bot 2>&1); echo 'closes:'; echo \"\$L\" | grep -c 'Closed position'; echo 'trailing-stop exits:'; echo \"\$L\" | grep -c 'Trailing stop hit'; echo 'take-profit exits:'; echo \"\$L\" | grep -ci 'take profit'"

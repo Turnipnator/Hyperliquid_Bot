@@ -1,13 +1,15 @@
 import pino from 'pino';
 import Decimal from 'decimal.js';
 import http from 'http';
+import path from 'path';
 import { config } from './config/config';
 import { HyperliquidClient } from './core/exchange/HyperliquidClient';
 import { BreakoutStrategy } from './core/strategy/BreakoutStrategy';
 import { RiskManager } from './core/risk/RiskManager';
+import { StreakPause } from './core/risk/StreakPause';
 import { TelegramService, BotStatusProvider } from './services/telegram/TelegramService';
 import { BinanceDataService } from './services/data/BinanceDataService';
-import { Environment } from './core/exchange/types';
+import { Environment, OrderSide } from './core/exchange/types';
 
 const logger = pino({ name: 'Main', level: config.logLevel });
 
@@ -23,6 +25,11 @@ class HyperliquidBot implements BotStatusProvider {
   private consecutiveErrors: number = 0;
   private lastErrorNotification: number = 0;
   private dailyLossHaltActive: boolean = false;
+  private streakPause: StreakPause;
+  private streakPauseActive: boolean = false;
+  private lastRealTradesSync: number = 0;
+  private readonly REAL_TRADES_SYNC_MS = 5 * 60 * 1000;
+  private readonly REAL_TRADES_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
   constructor() {
     // Initialize Hyperliquid client
@@ -71,6 +78,11 @@ class HyperliquidBot implements BotStatusProvider {
       maxLeverage: config.maxLeverage,
       maxDrawdown: config.maxDrawdown,
     });
+
+    this.streakPause = new StreakPause(
+      config.streakPauseTrades,
+      path.resolve(process.cwd(), 'logs', 'streak_pause_state.json')
+    );
 
     // Initialize Binance data service
     this.binanceData = new BinanceDataService(config.binanceBaseUrl);
@@ -256,6 +268,8 @@ class HyperliquidBot implements BotStatusProvider {
         }
       }
 
+      const streakPaused = await this.updateStreakPause();
+
       // Generate and execute signals if we have capacity and today's loss cap is not hit
       if (dailyLossHit) {
         logger.debug('Daily loss limit active - skipping signal generation');
@@ -270,7 +284,9 @@ class HyperliquidBot implements BotStatusProvider {
             // Generate signal
             const signal = await this.strategy.generateSignal(symbol);
 
-            if (signal) {
+            if (signal && streakPaused) {
+              this.recordShadowTrade(signal.symbol, signal.side, signal.entryPrice, positions.length);
+            } else if (signal) {
               // Check risk before executing - use actual position size (USD) as margin requirement
               const requiredMargin = config.positionSize;
 
@@ -294,6 +310,11 @@ class HyperliquidBot implements BotStatusProvider {
         positions: positions.length,
         dailyPnl: metrics.dailyPnl.toFixed(2),
         riskScore: metrics.riskScore,
+        ...(this.streakPause.isEnabled() && {
+          streakPaused,
+          lastTradesSumPct: (this.streakPause.recentSum() * 100).toFixed(2),
+          openShadows: this.streakPause.openShadowCount(),
+        }),
       }, 'Bot status');
       // Reset consecutive error count on success
       this.consecutiveErrors = 0;
@@ -337,6 +358,74 @@ class HyperliquidBot implements BotStatusProvider {
     } catch (error) {
       logger.warn({ error }, 'Could not sync daily P&L from exchange fills - keeping last value');
     }
+  }
+
+  /**
+   * Losing-streak pause: refresh real trades from fills (every 5 min), advance
+   * shadow trades on the latest closed candles, then decide whether new entries
+   * are paused. Announces each pause/resume once. Never throws.
+   */
+  private async updateStreakPause(): Promise<boolean> {
+    if (!this.streakPause.isEnabled()) {
+      return false;
+    }
+    try {
+      const now = Date.now();
+      if (now - this.lastRealTradesSync >= this.REAL_TRADES_SYNC_MS) {
+        const fills = await this.client.getFillsSince(now - this.REAL_TRADES_WINDOW_MS);
+        this.streakPause.setRealTrades(StreakPause.tradesFromFills(fills));
+        this.lastRealTradesSync = now;
+      }
+      for (const trade of this.streakPause.advanceShadows((symbol) => this.strategy.getPriceHistory(symbol))) {
+        logger.info(
+          { symbol: trade.symbol, returnPct: (trade.returnFraction * 100).toFixed(2) },
+          `👻 Shadow trade closed for ${trade.symbol}`
+        );
+      }
+    } catch (error) {
+      logger.warn({ error }, 'Could not update losing-streak pause - keeping last state');
+    }
+
+    const paused = this.streakPause.isPaused();
+    const sumPct = (this.streakPause.recentSum() * 100).toFixed(2);
+    const n = config.streakPauseTrades;
+    if (paused && !this.streakPauseActive) {
+      const message = `⏸️ Losing-streak pause: last ${n} trades sum to ${sumPct}%. New entries paused; ` +
+        `signals are tracked as shadow trades until the last ${n} turn positive. Open positions are still managed.`;
+      logger.warn(message);
+      if (this.telegram) {
+        await this.telegram.sendMessage(message);
+      }
+    } else if (!paused && this.streakPauseActive) {
+      const message = `▶️ Losing-streak pause lifted: last ${n} trades (incl. shadow) sum to +${sumPct}%. New entries resumed.`;
+      logger.info(message);
+      if (this.telegram) {
+        await this.telegram.sendMessage(message);
+      }
+    }
+    this.streakPauseActive = paused;
+    return paused;
+  }
+
+  private recordShadowTrade(symbol: string, side: OrderSide, entryPrice: Decimal, openPositions: number): void {
+    if (this.streakPause.hasOpenShadow(symbol)) {
+      return;
+    }
+    // Same capacity rule as real entries, counting open shadows as positions.
+    if (openPositions + this.streakPause.openShadowCount() >= config.maxPositions) {
+      logger.debug(`Shadow trade for ${symbol} skipped - at max positions`);
+      return;
+    }
+    const history = this.strategy.getPriceHistory(symbol);
+    const lastCandleTs = history && history.length > 0 ? history[history.length - 1].timestamp.getTime() : Date.now();
+    this.streakPause.openShadow(
+      symbol,
+      side === OrderSide.BUY,
+      entryPrice.toNumber(),
+      lastCandleTs,
+      this.strategy.getExitRules(symbol)
+    );
+    logger.info(`👻 Losing-streak pause active - ${symbol} ${side} @ ${entryPrice} recorded as a shadow trade, not executed`);
   }
 
   async getStatus(): Promise<{

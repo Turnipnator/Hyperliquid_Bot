@@ -57,6 +57,9 @@ Automated breakout trading bot for Hyperliquid perpetuals exchange. Uses wallet 
 - **Trailing Stop**: 5%
 - **Max Daily Loss**: $30 realised per UTC day, synced every minute from exchange fills (closedPnl − fees).
   When hit, no new entries until 00:00 UTC; open positions are still managed. Enforced since 2026-09-13.
+- **Losing-streak pause** (`STREAK_PAUSE_TRADES`, built 2026-11-02, off until set): new entries only while the last N
+  closed trades sum to a profit. While paused, signals become shadow trades (simulated on closed 5m candles with the
+  live exit rules, persisted in `logs/streak_pause_state.json`); trading resumes once real + shadow trades turn positive.
 - **Trading Pairs**: BTC, ETH, SOL, AVAX, BNB, SUI, LINK, XRP, TRX, ADA, HYPE, ZEC (12 pairs — TON removed 2026-09-13, delisted on Hyperliquid)
 
 ---
@@ -113,7 +116,7 @@ hyperliquid-bot/
 - **Exit execution**: IOC reduce-only limit 0.5% through the mark (fills as taker or not at all,
   never rests). An unfilled close is retried every 10 s; a position still open 2 min after a
   reported close has its resting orders cancelled and its stop checks re-armed.
-- **Take Profit**: 1.3% PARTIAL scale-out (2% for meme coins) - banks 50% of the
+- **Take Profit**: 5% PARTIAL scale-out (1.3% until 2026-10-25; no per-coin overrides are set) - banks 50% of the
   position, remaining 50% "runner" rides a 4% trail (`RUNNER_TRAILING_STOP_PERCENT`)
 - **Daily Loss Limit**: $30 realised per UTC day — pauses new entries, never force-closes or exits the process
 
@@ -134,6 +137,7 @@ TRADING_PAIRS=BTC,ETH,SOL,AVAX,BNB,SUI,LINK,XRP,TRX,ADA,HYPE,ZEC
 POSITION_SIZE=75              # USD per position (raised from 50 on 2026-09-13)
 MAX_POSITIONS=6
 MAX_DAILY_LOSS=30             # realised loss per UTC day (exchange fills) that pauses new entries
+STREAK_PAUSE_TRADES=5         # 0/unset = off; pause entries while the last N closed trades (incl. shadow) sum <= 0
 MAX_LEVERAGE=3
 
 # Strategy
@@ -143,7 +147,7 @@ VOL_MIN3_THRESHOLD=0.5        # sustained volume: min of last 3 candles must be 
 TRAILING_STOP_PERCENT=5       # trail from peak (ratchets up only)
 INITIAL_STOP_PERCENT=3        # hard stop from entry; trail takes over once it is tighter
 EXIT_SLIPPAGE_PERCENT=0.5     # IOC exit limit cushion through the mark (default 0.5)
-TAKE_PROFIT_PERCENT=1.3       # partial scale-out trigger
+TAKE_PROFIT_PERCENT=5         # partial scale-out trigger (1.3 until 2026-10-25)
 PARTIAL_TP_ENABLED=true       # bank 50% at TP, let the rest run
 PARTIAL_TP_FRACTION=0.5
 RUNNER_TRAILING_STOP_PERCENT=4  # tighter trail for the post-TP runner

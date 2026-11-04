@@ -123,6 +123,7 @@ export interface HyperliquidFill {
   time: number;
   oid?: number;
   crossed?: boolean;
+  startPosition?: string; // signed position size before this fill
 }
 
 export interface HyperliquidUserState {
