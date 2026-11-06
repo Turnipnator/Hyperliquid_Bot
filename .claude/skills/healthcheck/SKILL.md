@@ -183,7 +183,8 @@ actually contains recent strategy changes (don't trust that a rebuild took).
 
 ```bash
 # Latest change (2026-09-13): sig-fig price rounding + delisted-pair skip + exchange-fed daily loss cap.
-ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "docker exec hyperliquid-trading-bot sh -c \"echo client=\$(grep -c 'roundPrice\|getUntradeableReason' /app/dist/core/exchange/HyperliquidClient.js) index=\$(grep -c getUntradeableReason /app/dist/index.js) oldtable=\$(grep -c 'Default to 3 decimal places' /app/dist/core/strategy/BreakoutStrategy.js) dailycap=\$(grep -c isDailyLossLimitHit /app/dist/core/risk/RiskManager.js) sync=\$(grep -c syncDailyPnl /app/dist/index.js)\""
+# Single-quote the ssh command: inside ssh "…" the \$(grep) runs on the HOST, not in the container (empty counts, 2026-11-06).
+ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net 'docker exec hyperliquid-trading-bot sh -c "echo client=\$(grep -c \"roundPrice\|getUntradeableReason\" /app/dist/core/exchange/HyperliquidClient.js) index=\$(grep -c getUntradeableReason /app/dist/index.js) oldtable=\$(grep -c \"Default to 3 decimal places\" /app/dist/core/strategy/BreakoutStrategy.js) dailycap=\$(grep -c isDailyLossLimitHit /app/dist/core/risk/RiskManager.js) sync=\$(grep -c syncDailyPnl /app/dist/index.js) streak=\$(grep -c streakPause /app/dist/index.js)"'
 # Expect client>=4, index>=1, oldtable=0, dailycap>=1, sync>=1. Also confirm no pair is being evaluated that the exchange
 # has delisted: any 'Skipping <SYM>: delisted' warning at startup means TRADING_PAIRS needs cleaning.
 # Previous change (2026-09-02): hard initial stop + IOC exits + pending-close re-validation.
