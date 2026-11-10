@@ -152,6 +152,11 @@ ssh -i ~/.ssh/claude_vps_key root@vmi2859456.contaboserver.net "L=\$(docker logs
 - `Could not save shadow trade state` (EACCES) after the last restart = host `logs/` not owned by uid 1001 →
   shadows lost on restart. Fix: `chown 1001 /root/HYPE_Bot/logs` (fixed once 2026-11-02 19:58).
 - State file `mtime` should be within the last few minutes.
+- Slow shadow book (since 2026-11-10, `SLOW_SHADOW_INTERVAL`): test-only, never trades. Report its closed trades from
+  `logs/shadow_<interval>_state.json` and grep `shadow trade closed|recorded as a shadow trade \(test book|Shadow trade digest sent|Could not update the`.
+  Shadow short book (`SHADOW_SHORTS_ENABLED`): `logs/shadow_shorts_state.json`, grep `Shadow short closed|Short signal - `; report the
+  `longs-paused` vs `longs-trading` split. Its strategy instance logs at warn only.
+  The slow book's signal lines carry logger name `BreakoutStrategy-<interval>`; exclude them when counting the live bot's rejections.
 
 ## 5. WIN RATE / EDGE (best-effort from logs)
 ```bash

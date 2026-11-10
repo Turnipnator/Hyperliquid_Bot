@@ -32,6 +32,7 @@ export interface ClosedTrade {
   openedAt: number;
   closedAt: number;
   returnFraction: number; // net of fees, as a fraction of entry notional
+  tag?: string; // free label set at entry (e.g. whether longs were paused)
 }
 
 interface ShadowTrade {
@@ -46,6 +47,7 @@ interface ShadowTrade {
   banked: number;
   tpTaken: boolean;
   rules: ExitRules;
+  tag?: string;
 }
 
 interface PersistedState {
@@ -142,13 +144,22 @@ export class StreakPause {
     return this.openShadows.length;
   }
 
+  public openShadowSymbols(): string[] {
+    return this.openShadows.map((s) => s.symbol);
+  }
+
+  public closedShadowTrades(): ClosedTrade[] {
+    return [...this.closedShadows];
+  }
+
   public openShadow(
     symbol: string,
     isLong: boolean,
     entry: number,
     candleTs: number,
     rules: ExitRules,
-    now: number = Date.now()
+    now: number = Date.now(),
+    tag?: string
   ): void {
     if (this.hasOpenShadow(symbol)) return;
     const stopDistance = rules.initialStopPercent / 100;
@@ -164,6 +175,7 @@ export class StreakPause {
       banked: 0,
       tpTaken: false,
       rules,
+      ...(tag !== undefined && { tag }),
     });
     this.save();
   }
@@ -208,6 +220,7 @@ export class StreakPause {
           openedAt: shadow.openedAt,
           closedAt,
           returnFraction: shadow.banked + shadow.remaining * move - 2 * SHADOW_FEE_RATE,
+          ...(shadow.tag !== undefined && { tag: shadow.tag }),
         };
         this.openShadows = this.openShadows.filter((s) => s !== shadow);
         this.closedShadows.push(trade);

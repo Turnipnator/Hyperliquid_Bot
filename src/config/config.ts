@@ -29,6 +29,10 @@ export interface Config {
   maxLeverage: number;
   maxDrawdown: Decimal;
   streakPauseTrades: number; // 0 = off; else pause entries while the last N closed trades sum <= 0
+  slowShadowInterval: string; // '' = off; else a candle size (1h, 4h...) whose signals are tracked as shadow trades only
+  shadowDigestHourUtc: number; // UTC hour of the daily shadow-trade Telegram digest; -1 = off
+  shadowShortsEnabled: boolean; // track 5m short signals as shadow trades only (test book)
+  shadowShortRsiFloor: number; // RSI floor for those shadow shorts (the live rule is 45)
 
   // Breakout Strategy
   lookbackPeriod: number;
@@ -121,6 +125,15 @@ function validateConfig(config: Config): void {
   if (!Number.isInteger(config.streakPauseTrades) || config.streakPauseTrades < 0) {
     throw new Error('STREAK_PAUSE_TRADES must be a whole number >= 0 (0 = off)');
   }
+  if (config.slowShadowInterval && !['15m', '30m', '1h', '2h', '4h'].includes(config.slowShadowInterval)) {
+    throw new Error('SLOW_SHADOW_INTERVAL must be one of 15m, 30m, 1h, 2h, 4h (unset = off)');
+  }
+  if (!(config.shadowShortRsiFloor >= 0 && config.shadowShortRsiFloor <= 100)) {
+    throw new Error('SHADOW_SHORT_RSI_FLOOR must be between 0 and 100');
+  }
+  if (!Number.isInteger(config.shadowDigestHourUtc) || config.shadowDigestHourUtc < -1 || config.shadowDigestHourUtc > 23) {
+    throw new Error('SHADOW_DIGEST_HOUR_UTC must be a whole hour 0-23 (-1 = off)');
+  }
 
   // Validate strategy parameters
   if (config.lookbackPeriod < 2) {
@@ -193,6 +206,10 @@ export function loadConfig(): Config {
     maxLeverage: getEnvNumber('MAX_LEVERAGE', 3),
     maxDrawdown: getEnvDecimal('MAX_DRAWDOWN', '10'),
     streakPauseTrades: getEnvNumber('STREAK_PAUSE_TRADES', 0),
+    slowShadowInterval: (process.env.SLOW_SHADOW_INTERVAL || '').trim(),
+    shadowDigestHourUtc: getEnvNumber('SHADOW_DIGEST_HOUR_UTC', 7),
+    shadowShortsEnabled: getEnvBoolean('SHADOW_SHORTS_ENABLED', false),
+    shadowShortRsiFloor: getEnvNumber('SHADOW_SHORT_RSI_FLOOR', 30),
 
     // Breakout Strategy
     lookbackPeriod: getEnvNumber('LOOKBACK_PERIOD', 10),

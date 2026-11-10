@@ -23,6 +23,11 @@ export interface BreakoutConfig {
   runnerTrailingStopPercent?: number; // trailing % for the remaining "runner" after partial TP
   initialStopPercent?: number; // hard stop distance from entry; the trail only ever tightens from here
   exitSlippagePercent?: number; // cushion applied to IOC exit limits (default 0.5%)
+  candleInterval?: string; // candle size the signals are computed on (default 5m)
+  logName?: string; // logger name, so a signal-only instance is told apart in the logs
+  logLevel?: string; // logger level override (a signal-only instance on the same candles stays quiet)
+  longOnly?: boolean; // overrides LONG_ONLY for a signal-only instance (default: the global setting)
+  shortRsiFloor?: number; // shorts are rejected below this RSI (default 45)
 }
 
 export interface Signal {
@@ -160,7 +165,7 @@ export class BreakoutStrategy {
     this.client = client;
     this.config = strategyConfig;
     this.telegram = telegram;
-    this.logger = pino({ name: 'BreakoutStrategy', level: config.logLevel });
+    this.logger = pino({ name: strategyConfig.logName ?? 'BreakoutStrategy', level: strategyConfig.logLevel ?? config.logLevel });
     this.dataService = new BinanceDataService(config.binanceBaseUrl);
   }
 
@@ -173,15 +178,16 @@ export class BreakoutStrategy {
     return this.client.roundPrice(price, symbol);
   }
 
-  public async updatePriceHistory(symbol: string): Promise<void> {
+  /** Appends newly closed candles; returns how many were added. */
+  public async updatePriceHistory(symbol: string): Promise<number> {
     try {
-      // Fetch latest 5m candles from the same source as historical data
+      // Fetch latest candles from the same source as historical data
       // This ensures volume comparisons are apples-to-apples
-      const recentCandles = await this.dataService.getHistoricalCandles(symbol, '5m', 5);
+      const recentCandles = await this.dataService.getHistoricalCandles(symbol, this.config.candleInterval ?? '5m', 5);
 
       if (!recentCandles || recentCandles.length === 0) {
         this.logger.debug(`No recent candles fetched for ${symbol}`);
-        return;
+        return 0;
       }
 
       const history = this.priceHistory.get(symbol) || [];
@@ -210,8 +216,10 @@ export class BreakoutStrategy {
         const latestCandle = history[history.length - 1];
         this.logger.debug(`${symbol}: Added ${newCandlesAdded} new candle(s), total: ${history.length}, latest close: $${latestCandle.close.toFixed(2)}`);
       }
+      return newCandlesAdded;
     } catch (error) {
       this.logger.error({ error, symbol }, `Failed to update price history for ${symbol}`);
+      return 0;
     }
   }
 
@@ -405,7 +413,7 @@ export class BreakoutStrategy {
         this.logger.info(`${symbol}: ${breakout} breakout detected in ${trend} market`);
 
         // LONG ONLY MODE - Skip all short signals
-        if (config.longOnly && breakout === 'BEARISH') {
+        if ((this.config.longOnly ?? config.longOnly) && breakout === 'BEARISH') {
           this.logger.info(`${symbol}: BEARISH breakout SKIPPED - LONG_ONLY mode enabled`);
           return null;
         }
@@ -534,7 +542,7 @@ export class BreakoutStrategy {
 
         // RSI Filter - avoid buying overbought, avoid shorting oversold/extended
         const RSI_OVERBOUGHT = 70;
-        const RSI_OVERSOLD = 45; // Raised from 30 to avoid shorting extended moves
+        const RSI_OVERSOLD = this.config.shortRsiFloor ?? 45; // Raised from 30 to avoid shorting extended moves
 
         if (breakout === 'BULLISH' && rsi.greaterThan(RSI_OVERBOUGHT)) {
           this.logger.info(`${symbol}: BULLISH signal REJECTED - RSI ${rsi.toFixed(2)} > ${RSI_OVERBOUGHT} (overbought)`);

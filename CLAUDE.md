@@ -60,6 +60,12 @@ Automated breakout trading bot for Hyperliquid perpetuals exchange. Uses wallet 
 - **Losing-streak pause** (`STREAK_PAUSE_TRADES`, built 2026-11-02, off until set): new entries only while the last N
   closed trades sum to a profit. While paused, signals become shadow trades (simulated on closed 5m candles with the
   live exit rules, persisted in `logs/streak_pause_state.json`); trading resumes once real + shadow trades turn positive.
+- **Slow shadow book** (`SLOW_SHADOW_INTERVAL`, built 2026-11-10, off until set): the same signal rules on slower candles
+  (e.g. `1h`), recorded as shadow trades only in `logs/shadow_<interval>_state.json`. Never places orders, never feeds the pause.
+- **Shadow short book** (`SHADOW_SHORTS_ENABLED`, built 2026-11-10, off until set): 5m short signals with the RSI floor at
+  `SHADOW_SHORT_RSI_FLOOR` (default 30; the live rule is 45), shadow trades only in `logs/shadow_shorts_state.json`, each tagged
+  with whether longs were paused at entry. `LONG_ONLY=true` still governs real trading.
+- **Shadow digest**: one Telegram message a day at `SHADOW_DIGEST_HOUR_UTC` (default 7, −1 = off) with both shadow books' results.
 - **Trading Pairs**: BTC, ETH, SOL, AVAX, BNB, SUI, LINK, XRP, TRX, ADA, HYPE, ZEC (12 pairs — TON removed 2026-09-13, delisted on Hyperliquid)
 
 ---
@@ -138,6 +144,9 @@ POSITION_SIZE=75              # USD per position (raised from 50 on 2026-09-13)
 MAX_POSITIONS=6
 MAX_DAILY_LOSS=30             # realised loss per UTC day (exchange fills) that pauses new entries
 STREAK_PAUSE_TRADES=5         # 0/unset = off; pause entries while the last N closed trades (incl. shadow) sum <= 0
+SLOW_SHADOW_INTERVAL=1h       # unset = off; test-only shadow trades from the same rules on slower candles
+SHADOW_SHORTS_ENABLED=true    # test-only shadow shorts (RSI floor SHADOW_SHORT_RSI_FLOOR, default 30); never traded
+SHADOW_DIGEST_HOUR_UTC=7      # daily Telegram shadow digest (default 7; -1 = off)
 MAX_LEVERAGE=3
 
 # Strategy

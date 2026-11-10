@@ -7,6 +7,7 @@ import { HyperliquidClient } from './core/exchange/HyperliquidClient';
 import { BreakoutStrategy } from './core/strategy/BreakoutStrategy';
 import { RiskManager } from './core/risk/RiskManager';
 import { StreakPause } from './core/risk/StreakPause';
+import { formatShadowDigest, ShadowBookSummary } from './core/risk/ShadowDigest';
 import { TelegramService, BotStatusProvider } from './services/telegram/TelegramService';
 import { BinanceDataService } from './services/data/BinanceDataService';
 import { Environment, OrderSide } from './core/exchange/types';
@@ -29,6 +30,15 @@ class HyperliquidBot implements BotStatusProvider {
   private streakPauseActive: boolean = false;
   private lastRealTradesSync: number = 0;
   private readonly REAL_TRADES_SYNC_MS = 5 * 60 * 1000;
+  // Research only: the same signal rules on slower candles, tracked as shadow
+  // trades in their own book. Never places orders and never feeds the pause.
+  private slowStrategy?: BreakoutStrategy;
+  private slowBook?: StreakPause;
+  // Research only: 5m short signals (looser RSI floor) on the live candles, shadow trades only.
+  private shortStrategy?: BreakoutStrategy;
+  private shortBook?: StreakPause;
+  private lastDigestDay: string = '';
+  private readonly SLOW_POLL_WINDOW_MS = 3 * 60 * 1000;
   private readonly REAL_TRADES_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
   constructor() {
@@ -69,6 +79,42 @@ class HyperliquidBot implements BotStatusProvider {
       },
       this.telegram  // Pass Telegram service to strategy
     );
+
+    if (config.slowShadowInterval) {
+      this.slowStrategy = new BreakoutStrategy(this.client, {
+        lookbackPeriod: config.lookbackPeriod,
+        volumeMultiplier: config.volumeMultiplier,
+        volMin3Threshold: config.volMin3Threshold,
+        trailingStopPercent: config.trailingStopPercent,
+        positionSize: config.positionSize,
+        useScalping: config.useScalping,
+        breakoutBuffer: config.breakoutBuffer,
+        candleInterval: config.slowShadowInterval,
+        logName: `BreakoutStrategy-${config.slowShadowInterval}`,
+      });
+      this.slowBook = new StreakPause(
+        0,
+        path.resolve(process.cwd(), 'logs', `shadow_${config.slowShadowInterval}_state.json`)
+      );
+    }
+
+    if (config.shadowShortsEnabled) {
+      this.shortStrategy = new BreakoutStrategy(this.client, {
+        lookbackPeriod: config.lookbackPeriod,
+        volumeMultiplier: config.volumeMultiplier,
+        volMin3Threshold: config.volMin3Threshold,
+        trailingStopPercent: config.trailingStopPercent,
+        positionSize: config.positionSize,
+        useScalping: config.useScalping,
+        breakoutBuffer: config.breakoutBuffer,
+        logName: 'BreakoutStrategy-shorts',
+        logLevel: 'warn',
+        longOnly: false,
+        shortRsiFloor: config.shadowShortRsiFloor,
+      });
+      this.shortBook = new StreakPause(0, path.resolve(process.cwd(), 'logs', 'shadow_shorts_state.json'));
+      logger.info(`👻 Shadow short book enabled (RSI floor ${config.shadowShortRsiFloor}; signals tracked, never traded)`);
+    }
 
     // Initialize risk manager
     this.riskManager = new RiskManager({
@@ -153,6 +199,28 @@ class HyperliquidBot implements BotStatusProvider {
         } catch (error) {
           logger.error({ error, symbol }, `Failed to load historical data for ${symbol}`);
         }
+      }
+
+      if (this.slowStrategy) {
+        for (const symbol of config.tradingPairs) {
+          try {
+            const candles = await this.binanceData.getHistoricalCandles(
+              symbol,
+              config.slowShadowInterval,
+              Math.max(250, config.lookbackPeriod * 2)
+            );
+            if (candles.length > 0) {
+              this.slowStrategy.initializeWithHistoricalData(symbol, candles);
+            }
+          } catch (error) {
+            logger.warn({ error, symbol }, `Could not load ${config.slowShadowInterval} candles for ${symbol}`);
+          }
+        }
+        logger.info(`👻 ${config.slowShadowInterval} shadow book enabled (signals tracked, never traded)`);
+      }
+      // A restart after today's digest hour must not send it a second time.
+      if (new Date().getUTCHours() >= config.shadowDigestHourUtc) {
+        this.lastDigestDay = new Date().toISOString().slice(0, 10);
       }
 
       // Cancel any orphaned open orders from previous runs
@@ -269,6 +337,9 @@ class HyperliquidBot implements BotStatusProvider {
       }
 
       const streakPaused = await this.updateStreakPause();
+      await this.updateSlowShadows();
+      await this.updateShortShadows(streakPaused);
+      await this.sendShadowDigestIfDue(streakPaused);
 
       // Generate and execute signals if we have capacity and today's loss cap is not hit
       if (dailyLossHit) {
@@ -405,6 +476,156 @@ class HyperliquidBot implements BotStatusProvider {
     }
     this.streakPauseActive = paused;
     return paused;
+  }
+
+  /**
+   * Slow-candle shadow book. Signals are evaluated once per newly closed slow
+   * candle; exits are simulated on the live 5m candles with the live exit rules.
+   */
+  private async updateSlowShadows(): Promise<void> {
+    if (!this.slowStrategy || !this.slowBook) {
+      return;
+    }
+    const interval = config.slowShadowInterval;
+    try {
+      for (const trade of this.slowBook.advanceShadows((symbol) => this.strategy.getPriceHistory(symbol))) {
+        logger.info(
+          { symbol: trade.symbol, returnPct: (trade.returnFraction * 100).toFixed(2) },
+          `👻 ${interval} shadow trade closed for ${trade.symbol}`
+        );
+      }
+      // A slow candle can only have closed just after an interval boundary.
+      const minutes = interval.endsWith('h') ? parseInt(interval, 10) * 60 : parseInt(interval, 10);
+      if (Date.now() % (minutes * 60 * 1000) > this.SLOW_POLL_WINDOW_MS) {
+        return;
+      }
+      for (const symbol of config.tradingPairs) {
+        const added = await this.slowStrategy.updatePriceHistory(symbol);
+        if (added === 0 || this.slowBook.hasOpenShadow(symbol)) {
+          continue;
+        }
+        if (this.slowBook.openShadowCount() >= config.maxPositions) {
+          continue;
+        }
+        const signal = await this.slowStrategy.generateSignal(symbol);
+        const history = this.strategy.getPriceHistory(symbol);
+        if (!signal || !history || history.length === 0) {
+          continue;
+        }
+        this.slowBook.openShadow(
+          symbol,
+          signal.side === OrderSide.BUY,
+          signal.entryPrice.toNumber(),
+          history[history.length - 1].timestamp.getTime(),
+          this.strategy.getExitRules(symbol)
+        );
+        logger.info(`👻 ${interval} signal - ${symbol} ${signal.side} @ ${signal.entryPrice} recorded as a shadow trade (test book, never executed)`);
+      }
+    } catch (error) {
+      logger.warn({ error }, `Could not update the ${interval} shadow book`);
+    }
+  }
+
+  /**
+   * Shadow short book: the live 5m candles through a signal-only strategy with
+   * shorts allowed and a looser RSI floor. Each short is tagged with whether the
+   * long side was paused at entry, to test "shorts on while longs are losing".
+   */
+  private async updateShortShadows(streakPaused: boolean): Promise<void> {
+    if (!this.shortStrategy || !this.shortBook) {
+      return;
+    }
+    try {
+      for (const trade of this.shortBook.advanceShadows((symbol) => this.strategy.getPriceHistory(symbol))) {
+        logger.info(
+          { symbol: trade.symbol, returnPct: (trade.returnFraction * 100).toFixed(2), tag: trade.tag },
+          `👻 Shadow short closed for ${trade.symbol}`
+        );
+      }
+      for (const symbol of config.tradingPairs) {
+        const history = this.strategy.getPriceHistory(symbol);
+        if (!history || history.length === 0 || this.shortBook.hasOpenShadow(symbol)) {
+          continue;
+        }
+        if (this.shortBook.openShadowCount() >= config.maxPositions) {
+          break;
+        }
+        this.shortStrategy.initializeWithHistoricalData(symbol, history);
+        const signal = await this.shortStrategy.generateSignal(symbol);
+        if (!signal || signal.side !== OrderSide.SELL) {
+          continue;
+        }
+        const tag = streakPaused ? 'longs-paused' : 'longs-trading';
+        this.shortBook.openShadow(
+          symbol,
+          false,
+          signal.entryPrice.toNumber(),
+          history[history.length - 1].timestamp.getTime(),
+          this.strategy.getExitRules(symbol),
+          Date.now(),
+          tag
+        );
+        logger.info(`👻 Short signal - ${symbol} SELL @ ${signal.entryPrice} recorded as a shadow trade (${tag}; test book, never executed)`);
+      }
+    } catch (error) {
+      logger.warn({ error }, 'Could not update the shadow short book');
+    }
+  }
+
+  /** One Telegram digest of the shadow books per UTC day, at SHADOW_DIGEST_HOUR_UTC. */
+  private async sendShadowDigestIfDue(streakPaused: boolean): Promise<void> {
+    const now = new Date();
+    const today = now.toISOString().slice(0, 10);
+    if (
+      !this.telegram ||
+      config.shadowDigestHourUtc < 0 ||
+      now.getUTCHours() < config.shadowDigestHourUtc ||
+      this.lastDigestDay === today ||
+      (!this.streakPause.isEnabled() && !this.slowBook && !this.shortBook)
+    ) {
+      return;
+    }
+    this.lastDigestDay = today;
+    try {
+      const books: ShadowBookSummary[] = [];
+      if (this.streakPause.isEnabled()) {
+        books.push({
+          title: '5m signals skipped by the pause (what the live bot would have traded):',
+          closed: this.streakPause.closedShadowTrades(),
+          openSymbols: this.streakPause.openShadowSymbols(),
+        });
+      }
+      if (this.slowBook) {
+        books.push({
+          title: `${config.slowShadowInterval} signals (test book, never traded):`,
+          closed: this.slowBook.closedShadowTrades(),
+          openSymbols: this.slowBook.openShadowSymbols(),
+        });
+      }
+      if (this.shortBook) {
+        books.push({
+          title: `5m shorts, RSI floor ${config.shadowShortRsiFloor} (test book, never traded):`,
+          closed: this.shortBook.closedShadowTrades(),
+          openSymbols: this.shortBook.openShadowSymbols(),
+          splitTags: [
+            { tag: 'longs-paused', label: 'opened while longs paused' },
+            { tag: 'longs-trading', label: 'opened while longs trading' },
+          ],
+        });
+      }
+      await this.telegram.sendMessage(formatShadowDigest({
+        now: now.getTime(),
+        positionSizeUsd: config.positionSize.toNumber(),
+        streakPauseEnabled: this.streakPause.isEnabled(),
+        streakPaused,
+        lookback: config.streakPauseTrades,
+        recentSumPct: this.streakPause.recentSum() * 100,
+        books,
+      }));
+      logger.info('👻 Shadow trade digest sent');
+    } catch (error) {
+      logger.warn({ error }, 'Could not send the shadow trade digest');
+    }
   }
 
   private recordShadowTrade(symbol: string, side: OrderSide, entryPrice: Decimal, openPositions: number): void {
